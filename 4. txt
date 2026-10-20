@@ -1,0 +1,968 @@
+
+Option Explicit
+
+Private Type PEItem
+    Code As String
+    Num As Long
+    Model As String
+    Maker As String
+End Type
+
+
+' =====================================
+' ОСНОВНОЙ МАКРОС
+' =====================================
+
+Sub MakeWordPE()
+
+    Dim xl As Object, book As Object, sh As Object
+    Dim doc As Document, testDoc As Document
+    Dim testTable As Table, t As Table
+    Dim rg As Range
+
+    Dim a As Variant
+    Dim el() As PEItem, tmp As PEItem
+    Dim parts As Variant, part As Variant
+
+    Dim pages As Collection
+    Dim pageRows As Collection
+    Dim modelLines As Collection
+    Dim makerLines As Collection
+    Dim chunks As Collection
+
+    Dim rowData As Variant, pair As Variant
+    Dim piece As Variant
+
+    Dim file As String, ref As String
+    Dim firstRef As String, lastRef As String
+    Dim code As String, endCode As String
+    Dim model As String, maker As String
+    Dim grp As String, oldGrp As String
+
+    Dim last As Long, total As Long
+    Dim i As Long, j As Long, k As Long
+    Dim n1 As Long, n2 As Long
+    Dim num As Long, pos As Long
+    Dim pg As Long, rowNum As Long
+    Dim limit As Long, need As Long
+
+    On Error GoTo ErrorHandler
+
+    ' Выбор файла Excel
+
+    With Application.FileDialog(3)
+
+        .Title = "Выберите файл Excel"
+        .Filters.Clear
+        .Filters.Add "Excel", "*.xlsx;*.xlsm;*.xls"
+
+        If .Show <> -1 Then Exit Sub
+
+        file = .SelectedItems(1)
+
+    End With
+
+    ' Чтение Excel
+
+    Set xl = CreateObject("Excel.Application")
+    Set book = xl.Workbooks.Open(file, 0, True)
+    Set sh = book.Worksheets(1)
+
+    last = sh.Cells(sh.Rows.Count, 1).End(-4162).Row
+
+    If last < 2 Then
+        MsgBox "Нет данных."
+        GoTo Finish
+    End If
+
+    a = sh.Range("A2:C" & last).Value2
+
+    book.Close False
+    Set book = Nothing
+    xl.Quit
+    Set xl = Nothing
+
+
+    ' =====================================
+    ' ИЗМЕНЕНИЕ 1
+    ' РАЗБОР ОБОЗНАЧЕНИЙ ЧЕРЕЗ ПРОБЕЛ
+    ' =====================================
+
+    total = 0
+
+    For i = 1 To UBound(a, 1)
+
+        SplitName CStr(a(i, 2)), model, maker
+
+        ref = Trim(CStr(a(i, 1)))
+
+        ref = Replace(ref, "–", "-")
+        ref = Replace(ref, "—", "-")
+        ref = Replace(ref, ",", " ")
+        ref = Replace(ref, ";", " ")
+        ref = Replace(ref, vbTab, " ")
+        ref = Replace(ref, Chr(160), " ")
+
+        parts = Split(ref, " ")
+
+        For Each part In parts
+
+            ref = Trim(CStr(part))
+
+            If ref <> "" Then
+
+                pos = InStr(ref, "-")
+
+                If pos > 0 Then
+
+                    firstRef = Left(ref, pos - 1)
+                    lastRef = Mid(ref, pos + 1)
+
+                Else
+
+                    firstRef = ref
+                    lastRef = ref
+
+                End If
+
+                code = RefCode(firstRef)
+                endCode = RefCode(lastRef)
+
+                n1 = RefNum(firstRef)
+                n2 = RefNum(lastRef)
+
+                If code = "" Or n1 < 1 Or n2 < n1 _
+                   Or (endCode <> "" And endCode <> code) Then
+
+                    MsgBox "Ошибка обозначения: " & ref
+                    GoTo Finish
+
+                End If
+
+                For num = n1 To n2
+
+                    total = total + 1
+
+                    ReDim Preserve el(1 To total)
+
+                    el(total).Code = code
+                    el(total).Num = num
+                    el(total).Model = model
+                    el(total).Maker = maker
+
+                Next num
+
+            End If
+
+        Next part
+
+    Next i
+
+    If total = 0 Then GoTo Finish
+
+
+    ' =====================================
+    ' СОРТИРОВКА ОБОЗНАЧЕНИЙ
+    ' =====================================
+
+    For i = 1 To total - 1
+
+        For j = i + 1 To total
+
+            If el(j).Code < el(i).Code Or _
+               (el(j).Code = el(i).Code And _
+                el(j).Num < el(i).Num) Then
+
+                tmp = el(i)
+                el(i) = el(j)
+                el(j) = tmp
+
+            End If
+
+        Next j
+
+    Next i
+
+    ' Проверка повторяющихся номеров
+
+    For i = 2 To total
+
+        If el(i).Code = el(i - 1).Code And _
+           el(i).Num = el(i - 1).Num Then
+
+            MsgBox "Повтор: " & _
+                   el(i).Code & el(i).Num
+
+            GoTo Finish
+
+        End If
+
+    Next i
+
+
+    ' =====================================
+    ' ВРЕМЕННАЯ ТАБЛИЦА ДЛЯ ИЗМЕРЕНИЙ
+    ' =====================================
+
+    Set testDoc = Documents.Add(Visible:=False)
+
+    SetupPEPage testDoc
+
+    Set testTable = testDoc.Tables.Add( _
+        testDoc.Range(0, 0), 1, 4)
+
+    FormatPETable testTable
+
+    ' В пробной таблице разрешаем
+    ' увеличивать высоту для измерения
+
+    testTable.Rows.HeightRule = wdRowHeightAtLeast
+
+
+    ' =====================================
+    ' ПОДГОТОВКА СТРАНИЦ
+    ' =====================================
+
+    Set pages = New Collection
+    Set pageRows = New Collection
+
+    pages.Add pageRows
+
+    limit = 23
+    oldGrp = ""
+
+    i = 1
+
+    Do While i <= total
+
+        j = i
+
+        ' Объединяем соседние одинаковые
+
+        Do While j < total
+
+            If el(j + 1).Code <> el(i).Code Then
+                Exit Do
+            End If
+
+            If el(j + 1).Num <> el(j).Num + 1 Then
+                Exit Do
+            End If
+
+            If el(j + 1).Model <> el(i).Model Or _
+               el(j + 1).Maker <> el(i).Maker Then
+                Exit Do
+            End If
+
+            j = j + 1
+
+        Loop
+
+        code = el(i).Code
+        model = RemoveType(el(i).Model, code)
+        maker = el(i).Maker
+
+        If i = j Then
+
+            ref = code & el(i).Num
+
+        Else
+
+            ref = code & el(i).Num & "-" & _
+                  code & el(j).Num
+
+        End If
+
+        grp = GroupName(code)
+
+
+        ' =====================================
+        ' ИЗМЕНЕНИЕ 2
+        ' ПРОВЕРКА ШИРИНЫ И ПЕРЕНОСОВ
+        ' =====================================
+
+        Set chunks = New Collection
+
+        If maker <> "" And _
+           TextFits(testTable, _
+                    model & Space(3) & maker, 2) Then
+
+            ' Модель и фирма на одной строке
+
+            chunks.Add Array(model, maker)
+
+        Else
+
+            ' Наименование слева
+
+            Set modelLines = WrapText( _
+                testTable, model, 2)
+
+            For Each piece In modelLines
+
+                chunks.Add Array(CStr(piece), "")
+
+            Next piece
+
+            ' Изготовитель / ТУ справа
+            ' НА НОВЫХ СТРОКАХ ТАБЛИЦЫ
+
+            Set makerLines = WrapText( _
+                testTable, maker, 2)
+
+            For Each piece In makerLines
+
+                chunks.Add Array("", CStr(piece))
+
+            Next piece
+
+        End If
+
+        If chunks.Count = 0 Then
+            chunks.Add Array("", "")
+        End If
+
+
+        ' Проверка размещения группы
+
+        need = chunks.Count
+
+        If grp <> oldGrp Then
+            need = need + 3
+        End If
+
+        If need > limit And pageRows.Count = 0 Then
+
+            Err.Raise vbObjectError + 1, , _
+                "Слишком длинная запись: " & ref
+
+        End If
+
+        ' =====================================
+        ' ИЗМЕНЕНИЕ 3
+        ' ПЕРЕХОД НА СЛЕДУЮЩУЮ СТРАНИЦУ
+        ' =====================================
+
+        If pageRows.Count + need > limit Then
+
+            Do While pageRows.Count < limit
+
+                pageRows.Add Array("", "", "", "")
+
+            Loop
+
+            Set pageRows = New Collection
+            pages.Add pageRows
+
+            limit = 30
+
+        End If
+
+
+        ' Заголовок группы
+
+        If grp <> oldGrp Then
+
+            pageRows.Add Array("", "", "", "")
+
+            pageRows.Add Array("", grp, "", "")
+
+            pageRows.Add Array("", "", "", "")
+
+            oldGrp = grp
+
+        End If
+
+
+        ' =====================================
+        ' ИЗМЕНЕНИЕ 4
+        ' КАЖДЫЙ ПЕРЕНОС - ОТДЕЛЬНАЯ СТРОКА
+        ' =====================================
+
+        For k = 1 To chunks.Count
+
+            pair = chunks(k)
+
+            firstRef = ""
+            lastRef = ""
+
+            ' Обозначение в первой строке
+
+            If k = 1 Then
+                firstRef = ref
+            End If
+
+            ' Количество в последней строке
+
+            If k = chunks.Count Then
+                lastRef = CStr(j - i + 1)
+            End If
+
+            pageRows.Add Array(firstRef, _
+                               CStr(pair(0)), _
+                               CStr(pair(1)), _
+                               lastRef)
+
+        Next k
+
+        i = j + 1
+
+    Loop
+
+
+    ' Дополнение последней страницы
+
+    Do While pageRows.Count < limit
+
+        pageRows.Add Array("", "", "", "")
+
+    Loop
+
+    ' Закрываем пробный документ
+
+    testDoc.Close wdDoNotSaveChanges
+    Set testDoc = Nothing
+
+
+    ' =====================================
+    ' СОЗДАНИЕ РЕЗУЛЬТАТА В WORD
+    ' =====================================
+
+    Set doc = Documents.Add
+
+    SetupPEPage doc
+
+    For pg = 1 To pages.Count
+
+        If pg > 1 Then
+
+            Set rg = doc.Range( _
+                doc.Content.End - 1, _
+                doc.Content.End - 1)
+
+            rg.InsertBreak wdPageBreak
+
+        End If
+
+        Set rg = doc.Range( _
+            doc.Content.End - 1, _
+            doc.Content.End - 1)
+
+        Set pageRows = pages(pg)
+
+        Set t = doc.Tables.Add( _
+            rg, pageRows.Count, 4)
+
+        FormatPETable t
+
+        ' Заполнение таблицы
+
+        For rowNum = 1 To pageRows.Count
+
+            rowData = pageRows(rowNum)
+
+            t.Cell(rowNum, 1).Range.Text = _
+                CStr(rowData(0))
+
+            t.Cell(rowNum, 3).Range.Text = _
+                CStr(rowData(3))
+
+            ' Обозначение и количество
+            ' по горизонтали по центру
+
+            t.Cell(rowNum, 1).Range. _
+                ParagraphFormat.Alignment = _
+                wdAlignParagraphCenter
+
+            t.Cell(rowNum, 3).Range. _
+                ParagraphFormat.Alignment = _
+                wdAlignParagraphCenter
+
+            ' Наименование
+
+            With t.Cell(rowNum, 2).Range
+
+                If CStr(rowData(1)) <> "" And _
+                   CStr(rowData(2)) <> "" Then
+
+                    ' Модель слева, фирма справа
+
+                    .Text = CStr(rowData(1)) & _
+                            vbTab & CStr(rowData(2))
+
+                    .ParagraphFormat.TabStops.ClearAll
+
+                    .ParagraphFormat.TabStops.Add _
+                        Position:=CentimetersToPoints(11.02) - 7, _
+                        Alignment:=wdAlignTabRight
+
+                ElseIf CStr(rowData(2)) <> "" Then
+
+                    ' Только изготовитель / ТУ
+
+                    .Text = CStr(rowData(2))
+
+                    .ParagraphFormat.Alignment = _
+                        wdAlignParagraphRight
+
+                Else
+
+                    ' Только наименование
+
+                    .Text = CStr(rowData(1))
+
+                    .ParagraphFormat.Alignment = _
+                        wdAlignParagraphLeft
+
+                End If
+
+            End With
+
+        Next rowNum
+
+        t.Range.Font.Name = "Arial"
+        t.Range.Font.Size = 12
+
+    Next pg
+
+    MsgBox "Готово. Страниц: " & pages.Count
+
+Finish:
+
+    On Error Resume Next
+
+    If Not book Is Nothing Then book.Close False
+    If Not xl Is Nothing Then xl.Quit
+
+    If Not testDoc Is Nothing Then
+        testDoc.Close wdDoNotSaveChanges
+    End If
+
+    Exit Sub
+
+ErrorHandler:
+
+    MsgBox "Ошибка: " & Err.Description
+    Resume Finish
+
+End Sub
+
+
+' =====================================
+' ПАРАМЕТРЫ СТРАНИЦЫ
+' =====================================
+
+Sub SetupPEPage(doc As Document)
+
+    With doc.PageSetup
+
+        .PaperSize = wdPaperA4
+        .Orientation = wdOrientPortrait
+
+        .TopMargin = CentimetersToPoints(1.4)
+        .BottomMargin = CentimetersToPoints(1.4)
+
+        .LeftMargin = CentimetersToPoints(1.4)
+        .RightMargin = CentimetersToPoints(1.39)
+
+    End With
+
+End Sub
+
+
+' =====================================
+' ИЗМЕНЕНИЕ 5
+' ТОЧНЫЕ РАЗМЕРЫ СТРОК И СТОЛБЦОВ
+' =====================================
+
+Sub FormatPETable(t As Table)
+
+    t.AllowAutoFit = False
+
+    ' Ширина столбцов в сантиметрах
+
+    t.Columns(1).Width = CentimetersToPoints(1.99)
+    t.Columns(2).Width = CentimetersToPoints(11.02)
+    t.Columns(3).Width = CentimetersToPoints(1)
+    t.Columns(4).Width = CentimetersToPoints(4.2)
+
+    With t
+
+        .Borders.Enable = True
+
+        .TopPadding = 0
+        .BottomPadding = 0
+
+        .LeftPadding = 2
+        .RightPadding = 2
+
+    End With
+
+    ' Высота ровно 0,8 см
+
+    With t.Rows
+
+        .HeightRule = wdRowHeightExactly
+        .Height = CentimetersToPoints(0.8)
+
+        .AllowBreakAcrossPages = False
+
+    End With
+
+    ' Вертикальное выравнивание по центру
+
+    t.Range.Cells.VerticalAlignment = _
+        wdCellAlignVerticalCenter
+
+    With t.Range
+
+        .Font.Name = "Arial"
+        .Font.Size = 12
+
+        With .ParagraphFormat
+
+            .SpaceBefore = 0
+            .SpaceAfter = 0
+
+            .LeftIndent = 0
+            .RightIndent = 0
+            .FirstLineIndent = 0
+
+            .LineSpacingRule = wdLineSpaceSingle
+
+        End With
+
+    End With
+
+End Sub
+
+
+' =====================================
+' ПРОВЕРКА: ВЛЕЗАЕТ ЛИ ТЕКСТ В СТРОКУ
+' =====================================
+
+Function TextFits(t As Table, _
+                  s As String, _
+                  column As Long) As Boolean
+
+    Dim rg As Range
+    Dim count As Long
+
+    If s = "" Then
+
+        TextFits = True
+        Exit Function
+
+    End If
+
+    t.Cell(1, column).Range.Text = s
+
+    Set rg = t.Cell(1, column).Range
+
+    ' Исключаем маркер конца ячейки
+
+    rg.MoveEnd wdCharacter, -1
+
+    rg.Document.Repaginate
+
+    count = rg.ComputeStatistics(wdStatisticLines)
+
+    TextFits = (count <= 1)
+
+End Function
+
+
+' =====================================
+' ПЕРЕНОС ТЕКСТА НА СТРОКИ
+' =====================================
+
+Function WrapText(t As Table, _
+                  s As String, _
+                  column As Long) As Collection
+
+    Dim result As New Collection
+    Dim words As Variant, word As Variant
+
+    Dim line As String
+    Dim candidate As String
+    Dim part As String
+    Dim n As Long
+
+    s = Trim(Replace(s, vbTab, " "))
+
+    Do While InStr(s, "  ") > 0
+        s = Replace(s, "  ", " ")
+    Loop
+
+    If s = "" Then
+
+        Set WrapText = result
+        Exit Function
+
+    End If
+
+    words = Split(s, " ")
+
+    For Each word In words
+
+        part = CStr(word)
+
+        If line = "" Then
+            candidate = part
+        Else
+            candidate = line & " " & part
+        End If
+
+        If TextFits(t, candidate, column) Then
+
+            line = candidate
+
+        Else
+
+            If line <> "" Then
+                result.Add line
+                line = ""
+            End If
+
+            If TextFits(t, part, column) Then
+
+                line = part
+
+            Else
+
+                ' Если одно слово слишком длинное,
+                ' разбиваем его на части
+
+                Do While part <> ""
+
+                    n = LongestPart(t, part, column)
+
+                    result.Add Left(part, n)
+                    part = Mid(part, n + 1)
+
+                Loop
+
+            End If
+
+        End If
+
+    Next word
+
+    If line <> "" Then result.Add line
+
+    Set WrapText = result
+
+End Function
+
+
+' =====================================
+' ПОИСК МАКСИМАЛЬНОЙ ДЛИНЫ ФРАГМЕНТА
+' =====================================
+
+Function LongestPart(t As Table, _
+                     s As String, _
+                     column As Long) As Long
+
+    Dim lo As Long, hi As Long, mid As Long
+
+    lo = 1
+    hi = Len(s)
+
+    Do While lo < hi
+
+        mid = (lo + hi + 1) \ 2
+
+        If TextFits(t, Left(s, mid), column) Then
+
+            lo = mid
+
+        Else
+
+            hi = mid - 1
+
+        End If
+
+    Loop
+
+    LongestPart = lo
+
+End Function
+
+
+' =====================================
+' РАЗДЕЛЕНИЕ МОДЕЛИ И ИЗГОТОВИТЕЛЯ/ТУ
+' =====================================
+
+Sub SplitName(s As String, _
+              ByRef model As String, _
+              ByRef maker As String)
+
+    Dim p As Long, word As String
+
+    s = Trim(s)
+
+    model = s
+    maker = ""
+
+    p = InStr(1, s, " ф. ", vbTextCompare)
+
+    If p > 0 Then
+
+        model = Trim(Left(s, p - 1))
+        maker = Trim(Mid(s, p + 1))
+
+    Else
+
+        p = InStrRev(s, " ")
+
+        If p > 0 Then
+
+            word = Trim(Mid(s, p + 1))
+
+            If Len(word) > 2 And _
+               Right(UCase(word), 2) = "ТУ" And _
+               InStr(word, ".") > 0 Then
+
+                model = Trim(Left(s, p - 1))
+                maker = word
+
+            End If
+
+        End If
+
+    End If
+
+End Sub
+
+
+' =====================================
+' БУКВЕННОЕ ОБОЗНАЧЕНИЕ
+' =====================================
+
+Function RefCode(s As String) As String
+
+    Dim i As Long
+
+    s = UCase(Trim(s))
+
+    For i = 1 To Len(s)
+
+        If Mid(s, i, 1) Like "#" Then Exit For
+
+    Next i
+
+    RefCode = Left(s, i - 1)
+
+End Function
+
+
+' =====================================
+' НОМЕР ЭЛЕМЕНТА
+' =====================================
+
+Function RefNum(s As String) As Long
+
+    Dim i As Long
+
+    For i = 1 To Len(s)
+
+        If Mid(s, i, 1) Like "#" Then
+
+            RefNum = Val(Mid(s, i))
+            Exit Function
+
+        End If
+
+    Next i
+
+End Function
+
+
+' =====================================
+' УДАЛЕНИЕ ПОВТОРЯЮЩЕГОСЯ ТИПА
+' =====================================
+
+Function RemoveType(s As String, _
+                    code As String) As String
+
+    Dim prefix As String
+
+    Select Case code
+
+        Case "C"
+            prefix = "Конденсатор"
+
+        Case "R"
+            prefix = "Резистор"
+
+        Case "L"
+            prefix = "Катушка индуктивности"
+
+        Case "VD"
+            prefix = "Диод"
+
+        Case "VT"
+            prefix = "Транзистор"
+
+        Case "DA", "DD", "U"
+            prefix = "Микросхема"
+
+        Case Else
+            prefix = ""
+
+    End Select
+
+    If prefix <> "" Then
+
+        If StrComp(Left(s, Len(prefix) + 1), _
+           prefix & " ", vbTextCompare) = 0 Then
+
+            s = Mid(s, Len(prefix) + 2)
+
+        End If
+
+    End If
+
+    RemoveType = s
+
+End Function
+
+
+' =====================================
+' НАЗВАНИЯ ГРУПП
+' =====================================
+
+Function GroupName(code As String) As String
+
+    Select Case code
+
+        Case "C"
+            GroupName = "КОНДЕНСАТОРЫ"
+
+        Case "R"
+            GroupName = "РЕЗИСТОРЫ"
+
+        Case "L"
+            GroupName = "КАТУШКИ ИНДУКТИВНОСТИ"
+
+        Case "VD"
+            GroupName = "ДИОДЫ"
+
+        Case "VT"
+            GroupName = "ТРАНЗИСТОРЫ"
+
+        Case "DA", "DD", "U"
+            GroupName = "МИКРОСХЕМЫ"
+
+        Case "X", "XP", "XS"
+            GroupName = "СОЕДИНИТЕЛИ"
+
+        Case "ZQ"
+            GroupName = "РЕЗОНАТОРЫ"
+
+        Case Else
+            GroupName = "ЭЛЕМЕНТЫ " & code
+
+    End Select
+
+End Function
