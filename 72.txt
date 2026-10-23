@@ -1,0 +1,4796 @@
+Option Explicit
+
+
+
+' =====================================
+
+' WORD PE v2.13.0 (замены ТУ, словарь склонений, модели, исправление REF)
+
+' =====================================
+
+
+
+Private Type PEItem
+
+    Code As String
+
+    Num As Long
+
+    Model As String
+
+    Maker As String
+
+    TokenId As Long
+
+    NoteText As String
+
+    PickText As String
+
+    IsPicked As Boolean
+
+End Type
+
+
+
+Private Type PERecord
+
+    Ref As String
+
+    Code As String
+
+    TypeKey As String
+
+    Group As String
+
+    Model As String
+
+    Maker As String
+
+    Qty As Long
+
+    TUBlockId As Long
+
+    TUHeaderSeries As String
+
+    NoteText As String
+
+    NoteNo As Long
+
+    PickText As String
+
+    PickNo As Long
+
+    IsPicked As Boolean
+
+End Type
+
+
+
+Private Const FIRST_ROWS As Long = 23
+
+Private Const NEXT_ROWS As Long = 30
+
+Private Const REF_PADDING As Double = 0.08
+
+Private Const MIN_TU_ITEMS As Long = 4
+
+Private Const NOTE_SAFETY_SUFFIX As String = " оооо"
+
+Private Const NOTE_BOOKMARK_PREFIX As String = "PE_NOTE_"
+
+
+
+' Кэши существуют только во время одного запуска макроса.
+
+' Повторные проверки одинакового текста не обращаются к разметке Word.
+
+Private gTextFitCache As Object
+
+Private gItemRowsCache As Object
+
+
+
+' =====================================
+
+' ОСНОВНОЙ МАКРОС
+
+' =====================================
+
+
+
+Public Sub MakeWordPE()
+
+    Dim xl As Object, book As Object, sh As Object
+
+    Dim doc As Document
+
+    Dim testDoc1 As Document, testDoc2 As Document
+
+    Dim test1 As Table, test2 As Table, probe As Table
+
+    Dim excelData As Variant
+
+    Dim coloredParts As Collection, partData As Variant
+
+    Dim el() As PEItem
+
+    Dim rec() As PERecord
+
+    Dim pages As Collection, pageRows As Collection
+
+    Dim chunk As Collection, notes As Collection
+
+    Dim piece As Variant
+
+    Dim templateFile As String, excelFile As String
+
+    Dim outputFile As String, baseName As String
+
+    Dim ref As String, code As String, endCode As String
+
+    Dim firstRef As String, lastRef As String
+
+    Dim model As String, maker As String
+
+    Dim replacement As String, noteText As String
+
+    Dim total As Long, recCount As Long, last As Long
+
+    Dim token As Long, i As Long, j As Long, k As Long
+
+    Dim num As Long, n1 As Long, n2 As Long, pos As Long
+
+    Dim runEnd As Long, endIndex As Long, maxFinish As Long
+
+    Dim limit As Long, freeRows As Long, found As Boolean
+
+    Dim hasOtherResistors As Boolean
+
+    Dim sourceIsResistorSet As Boolean
+
+    Dim isPicked As Boolean, redStart As Boolean, redEnd As Boolean
+
+    Dim pickNote As String, rangeRef As Boolean
+
+    Dim itemCapacity As Long, recordCapacity As Long
+
+    Dim originalScreenUpdating As Boolean
+
+    Dim screenUpdatingChanged As Boolean
+
+
+
+    On Error GoTo ErrorHandler
+
+
+
+    With Application.FileDialog(3)
+
+        .Title = "Выберите шаблон Word"
+
+        .Filters.Clear
+
+        .Filters.Add "Word", "*.doc;*.docx;*.docm"
+
+        If .Show <> -1 Then Exit Sub
+
+        templateFile = .SelectedItems(1)
+
+    End With
+
+
+
+    With Application.FileDialog(3)
+
+        .Title = "Выберите перечень Excel"
+
+        .Filters.Clear
+
+        .Filters.Add "Excel", "*.xlsx;*.xlsm;*.xls"
+
+        If .Show <> -1 Then Exit Sub
+
+        excelFile = .SelectedItems(1)
+
+    End With
+
+
+
+    ' Excel: A - обозначение, B - наименование,
+
+    ' C - количество, D - допускаемая замена.
+
+    Set xl = CreateObject("Excel.Application")
+
+    Set book = xl.Workbooks.Open(excelFile, 0, True)
+
+    Set sh = book.Worksheets(1)
+
+    last = sh.Cells(sh.Rows.Count, 1).End(-4162).Row
+
+
+
+    If last < 2 Then
+
+        MsgBox "В Excel нет данных."
+
+        GoTo CleanExit
+
+    End If
+
+
+
+    excelData = sh.Range("A2:D" & last).Value2
+
+    ' Книга остаётся открытой до завершения чтения
+
+    ' форматирования символов столбца A.
+
+
+
+    ' Наборы резисторов переименовываем лишь тогда,
+
+    ' когда в исходном перечне есть обычные резисторы.
+
+    hasOtherResistors = HasOrdinaryResistors(excelData)
+
+
+
+    originalScreenUpdating = Application.ScreenUpdating
+
+    screenUpdatingChanged = True
+
+    Application.ScreenUpdating = False
+
+
+
+    total = 0
+
+    token = 0
+
+    itemCapacity = 256
+
+    ReDim el(1 To itemCapacity)
+
+
+
+    For i = 1 To UBound(excelData, 1)
+
+        ' Проверяем каждую ячейку отдельно.
+
+        ' Составные условия с Or здесь не нужны.
+
+        If VarType(excelData(i, 1)) = vbError Then
+
+            Err.Raise vbObjectError + 100, , "Ошибка в столбце A, строка " & CStr(i + 1)
+
+        End If
+
+
+
+        If VarType(excelData(i, 2)) = vbError Then
+
+            Err.Raise vbObjectError + 100, , "Ошибка в столбце B, строка " & CStr(i + 1)
+
+        End If
+
+
+
+        If VarType(excelData(i, 4)) = vbError Then
+
+            Err.Raise vbObjectError + 100, , "Ошибка в столбце D, строка " & CStr(i + 1)
+
+        End If
+
+
+
+        If VarType(excelData(i, 1)) = vbEmpty Then
+
+            GoTo NextExcelRow
+
+        End If
+
+
+
+        ref = Trim$(CStr(excelData(i, 1)))
+
+        If ref = "" Then GoTo NextExcelRow
+
+
+
+        If VarType(excelData(i, 2)) = vbEmpty Then
+
+            Err.Raise vbObjectError + 101, , "Нет наименования в строке " & CStr(i + 1)
+
+        End If
+
+
+
+        If Trim$(CStr(excelData(i, 2))) = "" Then
+
+            Err.Raise vbObjectError + 101, , "Нет наименования в строке " & CStr(i + 1)
+
+        End If
+
+
+
+        ' Запоминаем исходный тип до нормализации.
+
+        ' В перечне можно печатать "Резистор", но в
+
+        ' примечании замена набора остаётся набором.
+
+        sourceIsResistorSet = StartsWithTerm( CleanSpaces(CStr(excelData(i, 2))), "Набор резисторов")
+
+
+
+        SplitName NormalizeResistorSet( CStr(excelData(i, 2)), hasOtherResistors), model, maker
+
+        replacement = ""
+
+        If Not IsEmpty(excelData(i, 4)) Then
+
+            replacement = CleanSpaces(CStr(excelData(i, 4)))
+
+        End If
+
+
+
+        ' Дополнительные строки без обозначения используются как
+
+        ' допустимые номиналы для выделенных красным резисторов.
+
+        ' Варианты привязываются к этой исходной строке Excel.
+
+        pickNote = ""
+
+        Set coloredParts = ColoredReferenceTokens(sh.Cells(i + 1, 1))
+
+        ' Строки без красных обозначений не анализируем на подбор.
+
+        For Each partData In coloredParts
+
+            If CBool(partData(1)) Or CBool(partData(2)) Then
+
+                If StartsWithTerm(CleanSpaces(CStr(excelData(i, 2))), "Резистор") Then
+
+                    pickNote = BuildPickNoteText(excelData, i)
+
+                End If
+
+                Exit For
+
+            End If
+
+        Next partData
+
+
+
+        For Each partData In coloredParts
+
+            ref = CStr(partData(0))
+
+            redStart = CBool(partData(1))
+
+            redEnd = CBool(partData(2))
+
+            If ref <> "" Then
+
+                pos = InStr(ref, "-")
+
+                If pos > 0 Then
+
+                    firstRef = Left(ref, pos - 1)
+
+                    lastRef = Mid(ref, pos + 1)
+
+                Else
+
+                    firstRef = ref
+
+                    lastRef = ref
+
+                End If
+
+
+
+                code = RefCode(firstRef)
+
+                endCode = RefCode(lastRef)
+
+                If IsExcludedCode(code) Then GoTo NextReference
+
+
+
+                n1 = RefNum(firstRef)
+
+                n2 = RefNum(lastRef)
+
+                If code = "" Or n1 < 1 Or n2 < n1 Or (endCode <> "" And endCode <> code) Then
+
+                    Err.Raise vbObjectError + 102, , "Ошибка обозначения: " & ref
+
+                End If
+
+
+
+                noteText = ""
+
+                If replacement <> "" Then
+
+                    noteText = BuildNoteText( code, model, maker, replacement, sourceIsResistorSet)
+
+                End If
+
+
+
+                rangeRef = (n1 <> n2)
+
+                token = token + 1
+
+                For num = n1 To n2
+
+                    ' Для смешанного диапазона внутренние позиции
+
+                    ' наследуют цвет первого обозначения.
+
+                    If rangeRef Then
+
+                        If num = n2 Then
+
+                            isPicked = redEnd
+
+                        Else
+
+                            isPicked = redStart
+
+                        End If
+
+                    Else
+
+                        isPicked = (redStart Or redEnd)
+
+                    End If
+
+
+
+                    If isPicked And code <> "R" Then
+
+                        Err.Raise vbObjectError + 180, , "Красный цвет подбора поддерживается для резисторов R. Обозначение: " & code & CStr(num)
+
+                    End If
+
+                    If isPicked And pickNote = "" Then
+
+                        Err.Raise vbObjectError + 181, , "Для " & code & CStr(num) & " отсутствуют строки с допустимыми номиналами после строки Excel " & CStr(i + 1)
+
+                    End If
+
+                    total = total + 1
+
+                    If total > itemCapacity Then
+
+                        itemCapacity = itemCapacity * 2
+
+                        ReDim Preserve el(1 To itemCapacity)
+
+                    End If
+
+                    el(total).Code = code
+
+                    el(total).Num = num
+
+                    el(total).Model = model
+
+                    el(total).Maker = maker
+
+                    el(total).TokenId = token
+
+                    el(total).NoteText = noteText
+
+                    el(total).IsPicked = isPicked
+
+                    If isPicked Then
+
+                        el(total).PickText = pickNote
+
+                    Else
+
+                        el(total).PickText = ""
+
+                    End If
+
+                Next num
+
+            End If
+
+NextReference:
+
+        Next partData
+
+NextExcelRow:
+
+    Next i
+
+
+
+    ' Цвета Excel больше не нужны, поэтому закрываем источник.
+
+    book.Close False
+
+    Set book = Nothing
+
+    xl.Quit
+
+    Set xl = Nothing
+
+
+
+    If total = 0 Then
+
+        MsgBox "Нет элементов для перечня."
+
+        GoTo CleanExit
+
+    End If
+
+
+
+    ' Быстрая сортировка O(N log N) вместо двух вложенных циклов O(N^2).
+
+    ' Результат упорядочения прежний: сначала Code, затем Num.
+
+    If total > 1 Then QuickSortPEItems el, 1, total
+
+    ReDim Preserve el(1 To total)
+
+    DoEvents
+
+
+
+    For i = 2 To total
+
+        If el(i).Code = el(i - 1).Code And el(i).Num = el(i - 1).Num Then
+
+            Err.Raise vbObjectError + 103, , "Повтор обозначения: " & el(i).Code & el(i).Num
+
+        End If
+
+    Next i
+
+
+
+    ' Объединяем только элементы с одинаковой заменой.
+
+    recCount = 0
+
+    recordCapacity = 128
+
+    ReDim rec(1 To recordCapacity)
+
+    i = 1
+
+    Do While i <= total
+
+        j = i
+
+        Do While j < total
+
+            If el(j + 1).Code <> el(i).Code Then Exit Do
+
+            If el(j + 1).Num <> el(j).Num + 1 Then Exit Do
+
+            If StrComp(el(j + 1).Model, el(i).Model, vbTextCompare) <> 0 Then Exit Do
+
+            If StrComp(el(j + 1).Maker, el(i).Maker, vbTextCompare) <> 0 Then Exit Do
+
+            If StrComp(el(j + 1).NoteText, el(i).NoteText, vbTextCompare) <> 0 Then Exit Do
+
+            If el(j + 1).IsPicked <> el(i).IsPicked Then Exit Do
+
+            If StrComp(el(j + 1).PickText, el(i).PickText, vbTextCompare) <> 0 Then Exit Do
+
+            j = j + 1
+
+        Loop
+
+
+
+        recCount = recCount + 1
+
+        If recCount > recordCapacity Then
+
+            recordCapacity = recordCapacity * 2
+
+            ReDim Preserve rec(1 To recordCapacity)
+
+        End If
+
+        rec(recCount).Ref = BuildReference(el, i, j)
+
+        If el(i).IsPicked Then rec(recCount).Ref = rec(recCount).Ref & "*"
+
+        rec(recCount).Code = el(i).Code
+
+        rec(recCount).TypeKey = TypeKey(el(i).Code, el(i).Model)
+
+        rec(recCount).Group = GroupName(el(i).Code, el(i).Model)
+
+        rec(recCount).Model = el(i).Model
+
+        rec(recCount).Maker = el(i).Maker
+
+        rec(recCount).Qty = j - i + 1
+
+        rec(recCount).NoteText = el(i).NoteText
+
+        rec(recCount).IsPicked = el(i).IsPicked
+
+        rec(recCount).PickText = el(i).PickText
+
+        i = j + 1
+
+    Loop
+
+    ReDim Preserve rec(1 To recCount)
+
+    DoEvents
+
+
+
+    MarkRepeatedTU rec, recCount
+
+    Set notes = New Collection
+
+    NumberNotes rec, recCount, notes
+
+
+
+    ' Кэшируем результаты измерения текста и формирование строк.
+
+    Set gTextFitCache = CreateObject("Scripting.Dictionary")
+
+    gTextFitCache.CompareMode = vbBinaryCompare
+
+    Set gItemRowsCache = CreateObject("Scripting.Dictionary")
+
+
+
+    ' Таблицы для измерения ширины текста.
+
+    Set testDoc1 = Documents.Add(Visible:=False)
+
+    Set testDoc2 = Documents.Add(Visible:=False)
+
+    SetupPEPage testDoc1.Sections(1)
+
+    SetupPEPage testDoc2.Sections(1)
+
+    Set test1 = testDoc1.Tables.Add(testDoc1.Range(0, 0), 1, 4)
+
+    Set test2 = testDoc2.Tables.Add(testDoc2.Range(0, 0), 1, 4)
+
+    FormatPETable test1, 1, True
+
+    FormatPETable test2, 2, True
+
+
+
+    ' Сборка страниц элементов.
+
+    Set pages = New Collection
+
+    Set pageRows = New Collection
+
+    pages.Add pageRows
+
+    limit = FIRST_ROWS
+
+    AddBlank pageRows
+
+    i = 1
+
+
+
+    Do While i <= recCount
+
+        runEnd = i
+
+        Do While runEnd < recCount
+
+            If rec(runEnd + 1).TypeKey <> rec(i).TypeKey Then Exit Do
+
+            runEnd = runEnd + 1
+
+        Loop
+
+
+
+        Do While i <= runEnd
+
+            If pages.Count = 1 Then
+
+                Set probe = test1
+
+            Else
+
+                Set probe = test2
+
+            End If
+
+
+
+            freeRows = limit - pageRows.Count
+
+            maxFinish = i + freeRows - 1
+
+            If maxFinish > runEnd Then maxFinish = runEnd
+
+            found = False
+
+
+
+            For endIndex = maxFinish To i Step -1
+
+                Set chunk = MakePageChunk( rec, i, endIndex, probe, pageRows.Count > 1)
+
+                If chunk.Count <= freeRows Then
+
+                    found = True
+
+                    Exit For
+
+                End If
+
+            Next endIndex
+
+
+
+            If Not found Then
+
+                If pageRows.Count = 1 Then
+
+                    Err.Raise vbObjectError + 104, , "Запись не помещается на странице: " & rec(i).Ref
+
+                End If
+
+                NextPEPage pages, pageRows, limit
+
+            Else
+
+                For Each piece In chunk
+
+                    pageRows.Add piece
+
+                Next piece
+
+                i = endIndex + 1
+
+                If i <= runEnd Then NextPEPage pages, pageRows, limit
+
+                ' Даем интерфейсу обработать сообщения раз в заполненный фрагмент.
+
+                DoEvents
+
+            End If
+
+        Loop
+
+    Loop
+
+
+
+    If notes.Count > 0 Then
+
+        AppendNotesToPages pages, pageRows, limit, notes, test2
+
+    End If
+
+    FillPage pageRows, limit
+
+
+
+    testDoc1.Close wdDoNotSaveChanges
+
+    testDoc2.Close wdDoNotSaveChanges
+
+    Set testDoc1 = Nothing
+
+    Set testDoc2 = Nothing
+
+
+
+    Set doc = Documents.Open( FileName:=templateFile, ReadOnly:=True, AddToRecentFiles:=False)
+
+
+
+    If doc.Sections.Count <> 3 Then
+
+        Err.Raise vbObjectError + 105, , "В шаблоне должно быть 3 раздела."
+
+    End If
+
+
+
+    ' Стиль ПРИМЕЧАНИЯ в шаблоне не используется:
+
+    ' нумерацию создают самостоятельные поля SEQ.
+
+
+
+    baseName = Left(templateFile, InStrRev(templateFile, ".") - 1)
+
+    outputFile = baseName & "_PE.docx"
+
+    k = 1
+
+    Do While Dir(outputFile) <> ""
+
+        outputFile = baseName & "_PE_" & CStr(k) & ".docx"
+
+        k = k + 1
+
+    Loop
+
+
+
+    doc.SaveAs2 FileName:=outputFile, FileFormat:=wdFormatXMLDocument
+
+    ClearSectionBody doc, 2
+
+    ClearSectionBody doc, 1
+
+    doc.Sections(2).PageSetup.SectionStart = wdSectionNewPage
+
+    doc.Sections(3).PageSetup.SectionStart = wdSectionNewPage
+
+    SetupPEPage doc.Sections(1)
+
+    SetupPEPage doc.Sections(2)
+
+
+
+    For k = 1 To pages.Count
+
+        Set pageRows = pages(k)
+
+        WritePEPage doc, pageRows, k
+
+        ' На больших документах Word не выглядит зависшим.
+
+        DoEvents
+
+    Next k
+
+
+
+    ' SEQ не зависит от многоуровневых списков шаблона.
+
+    ' Сначала обновляем номера SEQ, затем перекрестные ссылки REF.
+
+
+
+    ' Единственный обязательный полный пересчет готового документа.
+
+    doc.Repaginate
+
+    UpdatePEReferences doc
+
+    doc.Save
+
+    MsgBox "Перечень готов!" & vbCrLf & "Страниц перечня: " & CStr(pages.Count) & vbCrLf & "Уникальных примечаний: " & CStr(notes.Count) & vbCrLf & "Файл: " & outputFile
+
+
+
+CleanExit:
+
+    On Error Resume Next
+
+    Set gTextFitCache = Nothing
+
+    Set gItemRowsCache = Nothing
+
+    If screenUpdatingChanged Then Application.ScreenUpdating = originalScreenUpdating
+
+    If Not book Is Nothing Then book.Close False
+
+    If Not xl Is Nothing Then xl.Quit
+
+    If Not testDoc1 Is Nothing Then testDoc1.Close wdDoNotSaveChanges
+
+    If Not testDoc2 Is Nothing Then testDoc2.Close wdDoNotSaveChanges
+
+    Exit Sub
+
+
+
+ErrorHandler:
+
+    MsgBox "Ошибка " & Err.Number & ": " & Err.Description
+
+    On Error Resume Next
+
+    If Not doc Is Nothing Then doc.Close wdDoNotSaveChanges
+
+    Resume CleanExit
+
+End Sub
+
+
+
+ ' =====================================
+
+' БЫСТРАЯ СОРТИРОВКА ЭЛЕМЕНТОВ
+
+' =====================================
+
+
+
+Private Function ComparePEItems(ByRef a As PEItem, ByRef b As PEItem) As Long
+
+    Dim codeComparison As Long
+
+    codeComparison = StrComp(a.Code, b.Code, vbBinaryCompare)
+
+
+
+    If codeComparison <> 0 Then
+
+        ComparePEItems = codeComparison
+
+    ElseIf a.Num < b.Num Then
+
+        ComparePEItems = -1
+
+    ElseIf a.Num > b.Num Then
+
+        ComparePEItems = 1
+
+    Else
+
+        ComparePEItems = 0
+
+    End If
+
+End Function
+
+
+
+Private Sub QuickSortPEItems(el() As PEItem, first As Long, last As Long)
+
+    Dim lo As Long, hi As Long
+
+    Dim pivot As PEItem, temp As PEItem
+
+
+
+    lo = first
+
+    hi = last
+
+    pivot = el(first + (last - first) \ 2)
+
+
+
+    Do While lo <= hi
+
+        Do While ComparePEItems(el(lo), pivot) < 0
+
+            lo = lo + 1
+
+        Loop
+
+        Do While ComparePEItems(el(hi), pivot) > 0
+
+            hi = hi - 1
+
+        Loop
+
+
+
+        If lo <= hi Then
+
+            temp = el(lo)
+
+            el(lo) = el(hi)
+
+            el(hi) = temp
+
+            lo = lo + 1
+
+            hi = hi - 1
+
+        End If
+
+    Loop
+
+
+
+    If first < hi Then QuickSortPEItems el, first, hi
+
+    If lo < last Then QuickSortPEItems el, lo, last
+
+End Sub
+
+
+
+' =====================================
+
+' СОСТАВЛЕНИЕ ТЕКСТА ПРИМЕЧАНИЯ
+
+' =====================================
+
+
+
+Private Function BuildNoteText(code As String, model As String, maker As String, replacement As String, sourceIsResistorSet As Boolean) As String
+
+    Dim originalName As String, newName As String
+
+    Dim newModel As String, newMaker As String
+
+    Dim prefix As String, sourceGenitive As String, targetAccusative As String
+
+    Dim familyName As String, qualifier As String
+
+
+
+    replacement = CleanSpaces(replacement)
+
+    If replacement = "" Then Exit Function
+
+
+
+    ' При замене одного ТУ другим создаём примечание о замене
+
+    ' изделия с конкретной моделью, а не двух обозначений ТУ.
+
+    If IsTU(replacement) Then
+
+        If Not IsTU(maker) Then
+
+            Err.Raise vbObjectError + 120, , "У исходного компонента нет отдельного ТУ для замены: " & FullTypeName(model, code)
+
+        End If
+
+        NoteTypeForms code, model, sourceIsResistorSet, sourceGenitive, targetAccusative, prefix
+
+        familyName = ExtractComponentModel(code, model)
+
+        If familyName = "" Then familyName = NoteSourceName(model, code)
+
+        qualifier = TUReplacementQualifier(code, model)
+
+        BuildNoteText = "Допускается замена " & sourceGenitive & " " & familyName & " с ТУ " & maker & " на " & targetAccusative & " " & familyName & " с ТУ " & replacement & qualifier
+
+        Exit Function
+
+    End If
+
+
+
+    ' Замена самого элемента: в столбце D сохраняем исходный тип.
+
+    originalName = NoteSourceName(model, code)
+
+    If maker <> "" Then originalName = originalName & " " & maker
+
+    SplitName replacement, newModel, newMaker
+
+
+
+    If Not HasExplicitType(newModel) Then
+
+        If sourceIsResistorSet And code = "R" Then
+
+            prefix = "Набор резисторов"
+
+        Else
+
+            prefix = PrefixName(code, model)
+
+        End If
+
+        If prefix <> "" Then newModel = prefix & " " & newModel
+
+    End If
+
+
+
+    newName = NoteTargetName(newModel)
+
+    If newMaker <> "" Then newName = newName & " " & newMaker
+
+    If StrComp(CleanSpaces(originalName), CleanSpaces(NoteSourceName(newModel, code) & " " & newMaker), vbTextCompare) = 0 Then Exit Function
+
+    BuildNoteText = "Допускается замена " & NoteSourceNoun(code, sourceIsResistorSet, model) & " " & originalName & " на " & newName
+
+End Function
+
+ ' =====================================
+
+' ПОДБОР СОПРОТИВЛЕНИЯ ПРИ РЕГУЛИРОВАНИИ
+
+' =====================================
+
+
+
+' Содержимое строки Excel с пустым A относится
+
+' к предыдущему обозначению. В примечании первым
+
+' указываем исходный номинал, затем варианты.
+
+Private Function BuildPickNoteText(excelData As Variant, sourceIndex As Long) As String
+
+    Dim nominals As New Collection
+
+    Dim keys As Object
+
+    Dim baseNominal As String, nominal As String
+
+    Dim nominalKey As String
+
+    Dim j As Long, optionsCount As Long
+
+    Dim valueText As String
+
+
+
+    Set keys = CreateObject("Scripting.Dictionary")
+
+    keys.CompareMode = vbTextCompare
+
+    baseNominal = ExtractResistorNominal(CStr(excelData(sourceIndex, 2)), nominalKey)
+
+    If baseNominal = "" Then Exit Function
+
+
+
+    nominals.Add baseNominal
+
+    keys.Add nominalKey, True
+
+
+
+    For j = sourceIndex + 1 To UBound(excelData, 1)
+
+        If VarType(excelData(j, 1)) = vbError Then Exit For
+
+        If Not IsEmpty(excelData(j, 1)) Then
+
+            If Trim$(CStr(excelData(j, 1))) <> "" Then Exit For
+
+        End If
+
+
+
+        If VarType(excelData(j, 2)) = vbError Then
+
+            Err.Raise vbObjectError + 182, , "Ошибка Excel в строке варианта подбора " & CStr(j + 1)
+
+        End If
+
+        If Not IsEmpty(excelData(j, 2)) Then
+
+            valueText = CleanSpaces(CStr(excelData(j, 2)))
+
+            If valueText <> "" Then
+
+                nominal = ExtractResistorNominal(valueText, nominalKey)
+
+                If nominal = "" Then
+
+                    Err.Raise vbObjectError + 183, , "Не найден номинал сопротивления в строке подбора Excel " & CStr(j + 1) & ": " & valueText
+
+                End If
+
+                optionsCount = optionsCount + 1
+
+                If Not keys.Exists(nominalKey) Then
+
+                    keys.Add nominalKey, True
+
+                    nominals.Add nominal
+
+                End If
+
+            End If
+
+        End If
+
+    Next j
+
+
+
+    If optionsCount = 0 Then Exit Function
+
+
+
+    BuildPickNoteText = "При регулировании допускается подбор сопротивления резистора из номиналов "
+
+    For j = 1 To nominals.Count
+
+        If j > 1 Then BuildPickNoteText = BuildPickNoteText & "; "
+
+        BuildPickNoteText = BuildPickNoteText & CStr(nominals(j))
+
+    Next j
+
+    BuildPickNoteText = BuildPickNoteText & " при таком же допуске и ТКС"
+
+End Function
+
+
+
+' Извлекает число + единицу непосредственно перед Ом, кОм, МОм.
+
+' Остальная маркировка резистора не влияет на результат.
+
+' Ключ учитывает эквивалентность 1000 Ом и 1 кОм.
+
+Private Function ExtractResistorNominal(source As String, ByRef nominalKey As String) As String
+
+    Dim rx As Object, matches As Object, m As Object
+
+    Dim magnitude As String, unitText As String
+
+    Dim multiplier As Double, numericValue As Double
+
+
+
+    nominalKey = ""
+
+    Set rx = CreateObject("VBScript.RegExp")
+
+    rx.Global = False
+
+    rx.IgnoreCase = True
+
+    rx.Pattern = "([0-9]+([.,][0-9]+)?)[ ]*(МОм|кОм|Ом)"
+
+
+
+    Set matches = rx.Execute(CleanSpaces(source))
+
+    If matches.Count = 0 Then Exit Function
+
+    Set m = matches(0)
+
+
+
+    magnitude = CStr(m.SubMatches(0))
+
+    unitText = CStr(m.SubMatches(2))
+
+    numericValue = Val(Replace(magnitude, ",", "."))
+
+
+
+    Select Case UCase$(unitText)
+
+        Case UCase$("МОм")
+
+            multiplier = 1000000#
+
+            unitText = "МОм"
+
+        Case UCase$("кОм")
+
+            multiplier = 1000#
+
+            unitText = "кОм"
+
+        Case Else
+
+            multiplier = 1#
+
+            unitText = "Ом"
+
+    End Select
+
+
+
+    numericValue = numericValue * multiplier
+
+    nominalKey = Format$(numericValue, "0.############")
+
+    ExtractResistorNominal = magnitude & " " & unitText
+
+End Function
+
+
+
+' Чтение форматирования только столбца A.
+
+' Collection содержит: обозначение, цвет левой и цвет правой границы.
+
+Private Function ColoredReferenceTokens(excelCell As Object) As Collection
+
+    Dim result As New Collection
+
+    Dim raw As String, tokenText As String
+
+    Dim tokenStart As Long, tokenEnd As Long
+
+    Dim pos As Long, dashPos As Long, tokenLength As Long
+
+    Dim redLeft As Boolean, redRight As Boolean
+
+
+
+    raw = CStr(excelCell.Value2)
+
+    pos = 1
+
+
+
+    Do While pos <= Len(raw)
+
+        If IsReferenceSeparator(Mid$(raw, pos, 1)) Then
+
+            pos = pos + 1
+
+        Else
+
+            tokenStart = pos
+
+            Do While pos <= Len(raw)
+
+                If IsReferenceSeparator(Mid$(raw, pos, 1)) Then Exit Do
+
+                pos = pos + 1
+
+            Loop
+
+            tokenEnd = pos - 1
+
+            tokenLength = tokenEnd - tokenStart + 1
+
+            tokenText = Mid$(raw, tokenStart, tokenLength)
+
+            tokenText = Replace(tokenText, "–", "-")
+
+            tokenText = Replace(tokenText, "—", "-")
+
+            dashPos = InStr(tokenText, "-")
+
+
+
+            If dashPos > 0 Then
+
+                redLeft = ExcelSubstringIsRed(excelCell, tokenStart, dashPos - 1)
+
+                redRight = ExcelSubstringIsRed(excelCell, tokenStart + dashPos, tokenLength - dashPos)
+
+            Else
+
+                redLeft = ExcelSubstringIsRed(excelCell, tokenStart, tokenLength)
+
+                redRight = redLeft
+
+            End If
+
+            result.Add Array(tokenText, redLeft, redRight)
+
+        End If
+
+    Loop
+
+    Set ColoredReferenceTokens = result
+
+End Function
+
+
+
+Private Function IsReferenceSeparator(ch As String) As Boolean
+
+    IsReferenceSeparator = (ch = " " Or ch = "," Or ch = ";" Or ch = vbTab Or ch = vbCr Or ch = vbLf Or ch = ChrW(160))
+
+End Function
+
+
+
+Private Function ExcelSubstringIsRed(excelCell As Object, charStart As Long, charLength As Long) As Boolean
+
+    Dim v As Variant
+
+    Dim i As Long
+
+
+
+    If charLength < 1 Then Exit Function
+
+    ' У целиком одноцветного фрагмента читается один цвет.
+
+    v = excelCell.Characters(charStart, charLength).Font.Color
+
+    If Not IsNull(v) Then
+
+        ExcelSubstringIsRed = IsRedColor(CLng(v))
+
+        Exit Function
+
+    End If
+
+
+
+    ' Если цвета смешанные, проверяем каждый символ отдельно.
+
+    For i = charStart To charStart + charLength - 1
+
+        v = excelCell.Characters(i, 1).Font.Color
+
+        If Not IsNull(v) Then
+
+            If IsRedColor(CLng(v)) Then
+
+                ExcelSubstringIsRed = True
+
+                Exit Function
+
+            End If
+
+        End If
+
+    Next i
+
+End Function
+
+
+
+' Excel возвращает цвет VBA RGB как число с каналами BGR.
+
+Private Function IsRedColor(colorValue As Long) As Boolean
+
+    Dim redValue As Long, greenValue As Long, blueValue As Long
+
+    redValue = colorValue And 255&
+
+    greenValue = (colorValue \ 256&) And 255&
+
+    blueValue = (colorValue \ 65536) And 255&
+
+    IsRedColor = (redValue >= 120 And redValue > greenValue + 25 And redValue > blueValue + 25)
+
+End Function
+
+
+
+' В графе примечаний могут быть две ссылки на один элемент.
+
+' Сохраняем номер у последней строки каждого поля REF.
+
+Private Sub AddReferenceLine(textLines As Collection, numbers As Collection, t As Table, noteNumber As Long)
+
+    Dim pieces As Collection
+
+    Dim i As Long
+
+
+
+    Set pieces = WrapText(t, "См. примечание " & CStr(noteNumber), 4)
+
+    For i = 1 To pieces.Count
+
+        textLines.Add CStr(pieces(i))
+
+        If i = pieces.Count Then
+
+            numbers.Add noteNumber
+
+        Else
+
+            numbers.Add 0
+
+        End If
+
+    Next i
+
+End Sub
+
+
+
+' Для вариационных примечаний неделимы отдельные номиналы.
+
+' Действует тот же запас ширины в четыре символа.
+
+Private Function WrapPickNoteText(t As Table, noteText As String) As Collection
+
+    Dim segments As New Collection
+
+    Dim prefix As String, suffix As String, values As String
+
+    Dim items As Variant, words As Variant, v As Variant
+
+    Dim i As Long
+
+
+
+    prefix = "При регулировании допускается подбор сопротивления резистора из номиналов "
+
+    suffix = " при таком же допуске и ТКС"
+
+    If Left$(noteText, Len(prefix)) <> prefix Or Right$(noteText, Len(suffix)) <> suffix Then
+
+        Err.Raise vbObjectError + 184, , "Неверный формат примечания о подборе: " & noteText
+
+    End If
+
+
+
+    words = Split(Trim$(prefix), " ")
+
+    For Each v In words
+
+        segments.Add CStr(v)
+
+    Next v
+
+
+
+    values = Mid$(noteText, Len(prefix) + 1, Len(noteText) - Len(prefix) - Len(suffix))
+
+    items = Split(values, ";")
+
+    For i = LBound(items) To UBound(items)
+
+        If i < UBound(items) Then
+
+            segments.Add Trim$(CStr(items(i))) & ";"
+
+        Else
+
+            segments.Add Trim$(CStr(items(i)))
+
+        End If
+
+    Next i
+
+
+
+    words = Split(Trim$(suffix), " ")
+
+    For Each v In words
+
+        segments.Add CStr(v)
+
+    Next v
+
+
+
+    Set WrapPickNoteText = WrapAtomicSegments(t, segments, 2, "000. ")
+
+End Function
+
+
+
+' Выбор родительного падежа для примечаний.
+
+' Для расширения списка добавляйте новые Case.
+
+' Для неизвестных типов используется слово "элемента".
+
+Private Function NoteSourceNoun(code As String, sourceIsResistorSet As Boolean, Optional model As String = "") As String
+
+    Dim sourceForm As String, targetForm As String, title As String
+
+    NoteTypeForms code, model, sourceIsResistorSet, sourceForm, targetForm, title
+
+    NoteSourceNoun = sourceForm
+
+End Function
+
+
+
+' =====================================
+
+' РАСШИРЯЕМЫЙ СЛОВАРЬ ТИПОВ И СКЛОНЕНИЙ
+
+'
+
+' genitive: "замена чего?"; accusative: "на что?".
+
+' Для нового типа добавьте ElseIf и его формы.
+
+' =====================================
+
+Private Sub NoteTypeForms(code As String, model As String, isResistorSet As Boolean, ByRef genitive As String, ByRef accusative As String, ByRef title As String)
+
+    Dim t As String
+
+    t = LeadingTypeName(model)
+
+    genitive = "элемента"
+
+    accusative = "элемент"
+
+    title = "Элемент"
+
+
+
+    If isResistorSet Or StrComp(t, "Набор резисторов", vbTextCompare) = 0 Then
+
+        title = "Набор резисторов"
+
+        genitive = "набора резисторов"
+
+        accusative = "набор резисторов"
+
+    ElseIf StrComp(t, "Перемычка", vbTextCompare) = 0 Then
+
+        title = "Перемычка"
+
+        genitive = "перемычки"
+
+        accusative = "перемычку"
+
+    ElseIf StrComp(t, "Вилка", vbTextCompare) = 0 Or UCase$(code) = "XP" Then
+
+        title = "Вилка"
+
+        genitive = "вилки"
+
+        accusative = "вилку"
+
+    ElseIf StrComp(t, "Розетка", vbTextCompare) = 0 Or UCase$(code) = "XS" Then
+
+        title = "Розетка"
+
+        genitive = "розетки"
+
+        accusative = "розетку"
+
+    ElseIf StrComp(t, "Модуль защиты", vbTextCompare) = 0 Or UCase$(code) = "Z" Then
+
+        title = "Модуль защиты"
+
+        genitive = "модуля защиты"
+
+        accusative = "модуль защиты"
+
+    ElseIf StrComp(t, "Конденсатор", vbTextCompare) = 0 Or UCase$(code) = "C" Then
+
+        title = "Конденсатор"
+
+        genitive = "конденсатора"
+
+        accusative = "конденсатор"
+
+    ElseIf StrComp(t, "Резистор", vbTextCompare) = 0 Or UCase$(code) = "R" Then
+
+        title = "Резистор"
+
+        genitive = "резистора"
+
+        accusative = "резистор"
+
+    ElseIf StrComp(t, "Микросхема", vbTextCompare) = 0 Or UCase$(code) = "D" Or UCase$(code) = "DA" Or UCase$(code) = "DD" Or UCase$(code) = "U" Then
+
+        title = "Микросхема"
+
+        genitive = "микросхемы"
+
+        accusative = "микросхему"
+
+    End If
+
+End Sub
+
+
+
+' Склоняем только тип, не затрагивая обозначение модели.
+
+Private Function NoteTargetName(model As String) As String
+
+    Dim t As String, tail As String, targetType As String
+
+    t = LeadingTypeName(model)
+
+    If t = "" Then
+
+        NoteTargetName = LowerFirst(model)
+
+        Exit Function
+
+    End If
+
+    tail = Mid$(model, Len(t) + 1)
+
+    Select Case UCase$(t)
+
+        Case "ВИЛКА": targetType = "вилку"
+
+        Case "РОЗЕТКА": targetType = "розетку"
+
+        Case "ПЕРЕМЫЧКА": targetType = "перемычку"
+
+        Case "МИКРОСХЕМА": targetType = "микросхему"
+
+        Case Else: targetType = LowerFirst(t)
+
+    End Select
+
+    NoteTargetName = targetType & tail
+
+End Function
+
+
+
+' Разбираем семейство модели до номинальных характеристик.
+
+' К12-56"Г"-25 В ... => К12-56"Г"
+
+' Р1-25ВК-0,125 Вт ... => Р1-25ВК
+
+' К24-52-20 В ... => К24-52 (после семейства идёт напряжение).
+
+' При неизвестном обозначении сохраняем остаток строки без типа.
+
+Private Function ExtractComponentModel(code As String, model As String) As String
+
+    Dim s As String, rx As Object, matches As Object
+
+    s = Trim$(RemoveType(model, code))
+
+    If s = "" Then Exit Function
+
+    If UCase$(code) = "C" Or UCase$(code) = "R" Then
+
+        Set rx = CreateObject("VBScript.RegExp")
+
+        rx.Global = False
+
+        rx.IgnoreCase = True
+
+        If UCase$(code) = "C" Then
+
+            rx.Pattern = "^[КK][0-9]+-[0-9]+[^- ]*"
+
+        Else
+
+            rx.Pattern = "^[РR][0-9]+-[0-9]+[^- ]*"
+
+        End If
+
+        If rx.Test(s) Then
+
+            Set matches = rx.Execute(s)
+
+            ExtractComponentModel = Trim$(CStr(matches(0).Value))
+
+            Exit Function
+
+        End If
+
+    End If
+
+    ExtractComponentModel = s
+
+End Function
+
+
+
+' Оговорка для замены ТУ. Для остальных типов ТК не упоминаем.
+
+Private Function TUReplacementQualifier(code As String, model As String) As String
+
+    Dim t As String
+
+    t = LeadingTypeName(model)
+
+    If UCase$(code) = "C" Or StrComp(t, "Конденсатор", vbTextCompare) = 0 Then
+
+        TUReplacementQualifier = ", с тем же номиналом, допуском и ТКЕ"
+
+    ElseIf UCase$(code) = "R" Or StrComp(t, "Резистор", vbTextCompare) = 0 Or StrComp(t, "Набор резисторов", vbTextCompare) = 0 Then
+
+        TUReplacementQualifier = ", с тем же номиналом, допуском и ТКУ"
+
+    Else
+
+        TUReplacementQualifier = ", с тем же номиналом и допуском"
+
+    End If
+
+End Function
+
+
+
+' Переход к первому слову примечания; поддерживает новые падежные формы.
+
+Private Function NoteIntroduction(s As String) As String
+
+    Dim name As Variant
+
+    For Each name In Array("набора резисторов", "модуля защиты", "конденсатора", "резистора", "перемычки", "микросхемы", "вилки", "розетки", "элемента")
+
+        If StartsWithTerm(s, "Допускается замена " & CStr(name)) Then
+
+            NoteIntroduction = "Допускается замена " & CStr(name)
+
+            Exit Function
+
+        End If
+
+    Next name
+
+End Function
+
+
+
+' Распознаёт также формы винительного падежа в части «на ...».
+
+Private Function LeadingTargetType(s As String) As String
+
+    Dim t As Variant
+
+    For Each t In Array("набор резисторов", "модуль защиты", "модуль питания", "конденсатор", "резистор", "микросхему", "перемычку", "вилку", "розетку", "микросхема", "вилка", "розетка", "перемычка", "генератор", "элемент")
+
+        If StartsWithTerm(s, CStr(t)) Then
+
+            LeadingTargetType = CStr(t)
+
+            Exit Function
+
+        End If
+
+    Next t
+
+End Function
+
+
+
+Private Function NoteSourceName(model As String, code As String) As String
+
+    Dim s As String, itemType As String
+
+    s = FullTypeName(model, code)
+
+    itemType = LeadingTypeName(s)
+
+    If itemType <> "" Then s = Trim$(Mid$(s, Len(itemType) + 1))
+
+    If s = "" Then s = FullTypeName(model, code)
+
+    NoteSourceName = s
+
+End Function
+
+' Возвращает явное название типа в начале строки.
+
+' Используется также при переносе примечаний:
+
+' тип и модель можно размещать по отдельности,
+
+' но саму модель внутри разбивать запрещено.
+
+Private Function LeadingTypeName(s As String) As String
+
+    ' Словарь полных названий. Длинные варианты проверяются первыми.
+
+    If StartsWithTerm(s, "Набор резисторов") Then
+
+        LeadingTypeName = "Набор резисторов"
+
+    ElseIf StartsWithTerm(s, "Модуль электропитания") Then
+
+        LeadingTypeName = "Модуль электропитания"
+
+    ElseIf StartsWithTerm(s, "Модуль питания") Then
+
+        LeadingTypeName = "Модуль питания"
+
+    ElseIf StartsWithTerm(s, "Модуль защиты") Then
+
+        LeadingTypeName = "Модуль защиты"
+
+    ElseIf StartsWithTerm(s, "Конденсатор") Then
+
+        LeadingTypeName = "Конденсатор"
+
+    ElseIf StartsWithTerm(s, "Резистор") Then
+
+        LeadingTypeName = "Резистор"
+
+    ElseIf StartsWithTerm(s, "Микросхема") Then
+
+        LeadingTypeName = "Микросхема"
+
+    ElseIf StartsWithTerm(s, "Перемычка") Then
+
+        LeadingTypeName = "Перемычка"
+
+    ElseIf StartsWithTerm(s, "Генератор") Then
+
+        LeadingTypeName = "Генератор"
+
+    ElseIf StartsWithTerm(s, "Вилка") Then
+
+        LeadingTypeName = "Вилка"
+
+    ElseIf StartsWithTerm(s, "Розетка") Then
+
+        LeadingTypeName = "Розетка"
+
+    ElseIf StartsWithTerm(s, "Диод") Then
+
+        LeadingTypeName = "Диод"
+
+    ElseIf StartsWithTerm(s, "Транзистор") Then
+
+        LeadingTypeName = "Транзистор"
+
+    ElseIf StartsWithTerm(s, "Трансформатор") Then
+
+        LeadingTypeName = "Трансформатор"
+
+    ElseIf StartsWithTerm(s, "Дроссель") Then
+
+        LeadingTypeName = "Дроссель"
+
+    ElseIf StartsWithTerm(s, "Реле") Then
+
+        LeadingTypeName = "Реле"
+
+    ElseIf StartsWithTerm(s, "Разъём") Then
+
+        LeadingTypeName = "Разъём"
+
+    ElseIf StartsWithTerm(s, "Разъем") Then
+
+        LeadingTypeName = "Разъем"
+
+    ElseIf StartsWithTerm(s, "Предохранитель") Then
+
+        LeadingTypeName = "Предохранитель"
+
+    ElseIf StartsWithTerm(s, "Светодиод") Then
+
+        LeadingTypeName = "Светодиод"
+
+    ElseIf StartsWithTerm(s, "Датчик") Then
+
+        LeadingTypeName = "Датчик"
+
+    End If
+
+End Function
+
+Private Function HasExplicitType(s As String) As Boolean
+
+    HasExplicitType = (LeadingTypeName(s) <> "")
+
+End Function
+
+
+
+Private Function LowerFirst(s As String) As String
+
+    s = Trim(s)
+
+    If s = "" Then Exit Function
+
+    LowerFirst = LCase(Left(s, 1)) & Mid(s, 2)
+
+End Function
+
+
+
+Private Function CleanSpaces(s As String) As String
+
+    s = Replace(s, Chr(160), " ")
+
+    s = Replace(s, vbTab, " ")
+
+    s = Replace(s, vbCr, " ")
+
+    s = Replace(s, vbLf, " ")
+
+    s = Trim(s)
+
+    Do While InStr(s, "  ") > 0
+
+        s = Replace(s, "  ", " ")
+
+    Loop
+
+    CleanSpaces = s
+
+End Function
+
+
+
+' =====================================
+
+' ПРИМЕЧАНИЯ: НУМЕРАЦИЯ И СТРАНИЦЫ
+
+' =====================================
+
+
+
+Private Sub NumberNotes(rec() As PERecord, recCount As Long, notes As Collection)
+
+    Dim i As Long
+
+    For i = 1 To recCount
+
+        rec(i).NoteNo = RegisterPENote(notes, rec(i).NoteText)
+
+        rec(i).PickNo = RegisterPENote(notes, rec(i).PickText)
+
+    Next i
+
+End Sub
+
+
+
+' Номер повторного примечания берём из уже созданного списка.
+
+Private Function RegisterPENote(notes As Collection, noteText As String) As Long
+
+    Dim i As Long
+
+    Dim normalized As String
+
+
+
+    normalized = CleanSpaces(noteText)
+
+    If normalized = "" Then Exit Function
+
+
+
+    For i = 1 To notes.Count
+
+        If StrComp(CStr(notes(i)), normalized, vbTextCompare) = 0 Then
+
+            RegisterPENote = i
+
+            Exit Function
+
+        End If
+
+    Next i
+
+
+
+    notes.Add normalized
+
+    RegisterPENote = notes.Count
+
+End Function
+
+
+
+Private Sub AppendNotesToPages( pages As Collection, ByRef pageRows As Collection, ByRef limit As Long, notes As Collection, t As Table)
+
+
+
+    Dim rows As Collection, piece As Variant
+
+    Dim i As Long, required As Long
+
+
+
+    If notes.Count = 0 Then Exit Sub
+
+
+
+    If pages.Count = 1 Then
+
+        NextPEPage pages, pageRows, limit
+
+    End If
+
+
+
+    Set rows = MakeNoteRows(CStr(notes(1)), 1, t)
+
+    required = rows.Count + 1
+
+    If pageRows.Count > 1 Then required = required + 1
+
+
+
+    If pageRows.Count + required > limit Then
+
+        NextPEPage pages, pageRows, limit
+
+    End If
+
+
+
+    If pageRows.Count > 1 Then AddBlank pageRows
+
+    AddNotesTitle pageRows
+
+
+
+    For i = 1 To notes.Count
+
+        Set rows = MakeNoteRows(CStr(notes(i)), i, t)
+
+
+
+        If pageRows.Count + rows.Count > limit Then
+
+            NextPEPage pages, pageRows, limit
+
+            ' Заголовок примечаний здесь не повторяем.
+
+        End If
+
+
+
+        If pageRows.Count + rows.Count > limit Then
+
+            Err.Raise vbObjectError + 121, , "Примечание " & CStr(i) & " целиком не помещается на страницу."
+
+        End If
+
+
+
+        For Each piece In rows
+
+            pageRows.Add piece
+
+        Next piece
+
+    Next i
+
+End Sub
+
+
+
+Private Sub AddNotesTitle(rows As Collection)
+
+    rows.Add Array( "", "П р и м е ч а н и я:", "", "", False, wdAlignParagraphCenter, False, False, "", True, False)
+
+End Sub
+
+
+
+Private Function MakeNoteRows( noteText As String, noteNumber As Long, t As Table) As Collection
+
+
+
+    Dim result As New Collection, lines As Collection
+
+    Dim i As Long
+
+
+
+    Set lines = WrapNoteText(t, noteText, noteNumber)
+
+
+
+    For i = 1 To lines.Count
+
+        ' data(11): поле SEQ только на первой физической строке.
+
+        If i = 1 Then
+
+            result.Add Array( "", CStr(lines(i)), "", "", False, wdAlignParagraphCenter, False, False, "", False, True, noteNumber)
+
+        Else
+
+            result.Add Array( "", CStr(lines(i)), "", "", False, wdAlignParagraphCenter, False, False, "", False, True, 0)
+
+        End If
+
+    Next i
+
+
+
+    Set MakeNoteRows = result
+
+End Function
+
+
+
+' =====================================
+
+' ПЕРЕНОС ПРИМЕЧАНИЯ
+
+'
+
+' Названия МОДЕЛЕЙ остаются целыми.
+
+' ТУ являются отдельными сегментами,
+
+' поэтому могут перейти на следующую строку.
+
+' =====================================
+
+
+
+Private Function WrapNoteText(t As Table, noteText As String, noteNumber As Long) As Collection
+
+    Dim segments As New Collection
+
+    Dim introduction As String, core As String
+
+    Dim sourceText As String, targetText As String
+
+    Dim sourceModel As String, sourceTU As String
+
+    Dim targetModel As String, targetTU As String
+
+    Dim targetType As String, suffix As String
+
+    Dim words As Variant, word As Variant
+
+    Dim p As Long, commaPos As Long, tuPos As Long
+
+
+
+    noteText = CleanSpaces(noteText)
+
+    If StartsWithTerm(noteText, "При регулировании допускается подбор сопротивления резистора") Then
+
+        Set WrapNoteText = WrapPickNoteText(t, noteText)
+
+        Exit Function
+
+    End If
+
+
+
+    introduction = NoteIntroduction(noteText)
+
+    If introduction = "" Then
+
+        Err.Raise vbObjectError + 140, , "Неизвестный формат примечания " & CStr(noteNumber) & ": " & noteText
+
+    End If
+
+    core = Trim$(Mid$(noteText, Len(introduction) + 1))
+
+    p = InStrRev(core, " на ", -1, vbTextCompare)
+
+    If p = 0 Then
+
+        Err.Raise vbObjectError + 141, , "Нет разделителя ' на ' в примечании " & CStr(noteNumber)
+
+    End If
+
+    sourceText = Trim$(Left$(core, p - 1))
+
+    targetText = Trim$(Mid$(core, p + Len(" на ")))
+
+    If sourceText = "" Or targetText = "" Then
+
+        Err.Raise vbObjectError + 142, , "Неполная замена в примечании " & CStr(noteNumber)
+
+    End If
+
+
+
+    ' Все слова преамбулы переносятся свободно.
+
+    words = Split(introduction, " ")
+
+    For Each word In words
+
+        segments.Add CStr(word)
+
+    Next word
+
+
+
+    If InStr(1, sourceText, " с ТУ ", vbTextCompare) > 0 And InStr(1, targetText, " с ТУ ", vbTextCompare) > 0 Then
+
+        ' Новый формат: модель — отдельный неделимый фрагмент;
+
+        ' каждое обозначение ТУ можно переносить на новую строку.
+
+        tuPos = InStr(1, sourceText, " с ТУ ", vbTextCompare)
+
+        sourceModel = Trim$(Left$(sourceText, tuPos - 1))
+
+        sourceTU = Trim$(Mid$(sourceText, tuPos + Len(" с ТУ ")))
+
+
+
+        commaPos = InStr(1, targetText, ", с тем же ", vbTextCompare)
+
+        If commaPos > 0 Then
+
+            suffix = Trim$(Mid$(targetText, commaPos + 1))
+
+            targetText = Trim$(Left$(targetText, commaPos - 1))
+
+        Else
+
+            suffix = ""
+
+        End If
+
+        targetType = LeadingTargetType(targetText)
+
+        If targetType <> "" Then targetText = Trim$(Mid$(targetText, Len(targetType) + 1))
+
+        tuPos = InStr(1, targetText, " с ТУ ", vbTextCompare)
+
+        If tuPos = 0 Then
+
+            Err.Raise vbObjectError + 145, , "Не найдено ТУ замены в примечании " & CStr(noteNumber)
+
+        End If
+
+        targetModel = Trim$(Left$(targetText, tuPos - 1))
+
+        targetTU = Trim$(Mid$(targetText, tuPos + Len(" с ТУ ")))
+
+        segments.Add sourceModel
+
+        segments.Add "с ТУ"
+
+        segments.Add sourceTU
+
+        If targetType <> "" Then
+
+            segments.Add "на " & targetType
+
+        Else
+
+            segments.Add "на"
+
+        End If
+
+        If targetModel <> "" Then segments.Add targetModel
+
+        segments.Add "с ТУ"
+
+        If suffix <> "" Then
+
+            segments.Add targetTU & ","
+
+            words = Split(suffix, " ")
+
+            For Each word In words
+
+                segments.Add CStr(word)
+
+            Next word
+
+        Else
+
+            segments.Add targetTU
+
+        End If
+
+    Else
+
+        ' Обычная замена элемента, включая ТУ как отдельный фрагмент.
+
+        SplitTrailingTU sourceText, sourceModel, sourceTU
+
+        SplitTrailingTU targetText, targetModel, targetTU
+
+        targetType = LeadingTargetType(targetModel)
+
+        If targetType <> "" Then targetModel = Trim$(Mid$(targetModel, Len(targetType) + 1))
+
+        If sourceModel <> "" Then segments.Add sourceModel
+
+        If sourceTU <> "" Then segments.Add sourceTU
+
+        If targetType <> "" Then
+
+            segments.Add "на " & targetType
+
+            If targetModel <> "" Then segments.Add targetModel
+
+        ElseIf targetModel <> "" Then
+
+            segments.Add "на " & targetModel
+
+        ElseIf targetTU <> "" Then
+
+            segments.Add "на " & targetTU
+
+            targetTU = ""
+
+        End If
+
+        If targetTU <> "" Then segments.Add targetTU
+
+    End If
+
+
+
+    Set WrapNoteText = WrapAtomicSegments(t, segments, 2, "000. ")
+
+End Function
+
+' Отделяет конечное ТУ от названия модели.
+
+' Например:
+
+' "К24-52-20 В-10 мкф-Н20 АБВГ.123456.ТУ"
+
+' -> модель "К24-52-20 В-10 мкф-Н20"
+
+' -> ТУ "АБВГ.123456.ТУ"
+
+Private Sub SplitTrailingTU( s As String, ByRef model As String, ByRef tu As String)
+
+
+
+    Dim p As Long, lastWord As String
+
+
+
+    s = CleanSpaces(s)
+
+    model = s
+
+    tu = ""
+
+
+
+    p = InStrRev(s, " ")
+
+    If p = 0 Then Exit Sub
+
+
+
+    lastWord = Trim(Mid(s, p + 1))
+
+    If IsTU(lastWord) Then
+
+        model = Trim(Left(s, p - 1))
+
+        tu = lastWord
+
+    End If
+
+End Sub
+
+
+
+' Каждый переданный сегмент неделим.
+
+' Модель с внутренними пробелами переносится
+
+' только целиком; ТУ является отдельным сегментом.
+
+Private Function WrapAtomicSegments( t As Table, segments As Collection, column As Long, Optional firstLineReserve As String = "") As Collection
+
+
+
+    Dim result As New Collection
+
+    Dim segment As Variant
+
+    Dim part As String, line As String, candidate As String
+
+    Dim reserve As String
+
+
+
+    line = ""
+
+    reserve = firstLineReserve
+
+
+
+    For Each segment In segments
+
+        part = CStr(segment)
+
+
+
+        ' Неделимая модель должна помещаться с запасом в четыре буквы.
+
+        If Not TextFits(t, part & NOTE_SAFETY_SUFFIX, column) Then
+
+            Err.Raise vbObjectError + 143, , "Фрагмент примечания не помещается целиком с запасом в графу 'Наименование': " & part
+
+        End If
+
+
+
+        If line = "" Then
+
+            candidate = part
+
+        Else
+
+            candidate = line & " " & part
+
+        End If
+
+
+
+        ' Резерв проверяем и на первой, и на остальных строках.
+
+        If TextFits(t, reserve & candidate & NOTE_SAFETY_SUFFIX, column) Then
+
+            line = candidate
+
+        Else
+
+            If line <> "" Then
+
+                result.Add line
+
+                reserve = ""
+
+                line = part
+
+            Else
+
+                Err.Raise vbObjectError + 144, , "Первый фрагмент примечания не помещается с запасом после номера: " & part
+
+            End If
+
+        End If
+
+    Next segment
+
+
+
+    If line <> "" Then result.Add line
+
+    Set WrapAtomicSegments = result
+
+End Function
+
+
+
+' =====================================
+
+' ГРУППЫ И ОБЩИЕ ТУ
+
+' =====================================
+
+
+
+Private Function MakePageChunk( rec() As PERecord, first As Long, last As Long, t As Table, needGap As Boolean) As Collection
+
+
+
+    Dim result As New Collection, tuIds As New Collection
+
+    Dim rows As Collection, id As Variant
+
+    Dim i As Long, hasHeader As Boolean, hideTU As Boolean
+
+
+
+    hasHeader = (last > first And rec(first).Group <> "")
+
+
+
+    If hasHeader Then
+
+        For i = first To last
+
+            If rec(i).TUBlockId > 0 Then
+
+                If Not CollectionHasLong(tuIds, rec(i).TUBlockId) Then
+
+                    tuIds.Add rec(i).TUBlockId
+
+                End If
+
+            End If
+
+        Next i
+
+    End If
+
+
+
+    If needGap Then AddBlank result
+
+
+
+    If hasHeader Then
+
+        result.Add Array( "", rec(first).Group, "", "", True, wdAlignParagraphCenter, False, False, "", False, False)
+
+
+
+        For Each id In tuIds
+
+            For i = first To last
+
+                If rec(i).TUBlockId = CLng(id) Then
+
+                    Set rows = MakeTUHeaderRows(rec(i), t)
+
+                    AppendRows result, rows
+
+                    Exit For
+
+                End If
+
+            Next i
+
+        Next id
+
+
+
+        AddBlank result
+
+    End If
+
+
+
+    For i = first To last
+
+        hideTU = False
+
+        If hasHeader And rec(i).TUBlockId > 0 Then
+
+            hideTU = CollectionHasLong(tuIds, rec(i).TUBlockId)
+
+        End If
+
+
+
+        Set rows = CachedItemRows(rec, i, Not hasHeader, t, hideTU)
+
+        AppendRows result, rows
+
+    Next i
+
+
+
+    Set MakePageChunk = result
+
+End Function
+
+
+
+ ' =====================================
+
+' КЭШ РАЗБИЕНИЯ КОМПОНЕНТОВ НА СТРОКИ
+
+' =====================================
+
+
+
+Private Function CachedItemRows(rec() As PERecord, itemIndex As Long, fullType As Boolean, t As Table, hideTU As Boolean) As Collection
+
+    Dim cacheKey As String
+
+    Dim rows As Collection
+
+
+
+    ' Ширина четвертой графы отличает первую страницу от следующих.
+
+    cacheKey = CStr(t.Columns(4).Width) & "|" & CStr(itemIndex) & "|" & CStr(Abs(CLng(fullType))) & "|" & CStr(Abs(CLng(hideTU)))
+
+
+
+    If Not gItemRowsCache Is Nothing Then
+
+        If gItemRowsCache.Exists(cacheKey) Then
+
+            Set CachedItemRows = gItemRowsCache(cacheKey)
+
+            Exit Function
+
+        End If
+
+    End If
+
+
+
+    Set rows = MakeItemRows(rec(itemIndex), fullType, t, hideTU)
+
+    If Not gItemRowsCache Is Nothing Then gItemRowsCache.Add cacheKey, rows
+
+    Set CachedItemRows = rows
+
+End Function
+
+
+
+Private Function CollectionHasLong( values As Collection, number As Long) As Boolean
+
+
+
+    Dim item As Variant
+
+    For Each item In values
+
+        If CLng(item) = number Then
+
+            CollectionHasLong = True
+
+            Exit Function
+
+        End If
+
+    Next item
+
+End Function
+
+
+
+Private Sub AppendRows( destination As Collection, source As Collection)
+
+
+
+    Dim item As Variant
+
+    For Each item In source
+
+        destination.Add item
+
+    Next item
+
+End Sub
+
+
+
+Private Function IsExcludedCode(code As String) As Boolean
+
+    Dim s As String
+
+    s = UCase(Trim(code))
+
+    s = Replace(s, "К", "K")
+
+    s = Replace(s, "Т", "T")
+
+    IsExcludedCode = (s = "KT")
+
+End Function
+
+
+
+Private Sub MarkRepeatedTU( rec() As PERecord, recCount As Long)
+
+
+
+    Dim i As Long, j As Long, p As Long
+
+    Dim runStart As Long, runEnd As Long
+
+    Dim blockId As Long, countTU As Long
+
+    Dim series As String, otherSeries As String, maker As String
+
+
+
+    blockId = 0
+
+    runStart = 1
+
+
+
+    Do While runStart <= recCount
+
+        runEnd = runStart
+
+
+
+        Do While runEnd < recCount
+
+            If rec(runEnd + 1).TypeKey <> rec(runStart).TypeKey Then Exit Do
+
+            If rec(runEnd + 1).Group <> rec(runStart).Group Then Exit Do
+
+            runEnd = runEnd + 1
+
+        Loop
+
+
+
+        If rec(runStart).Group <> "" Then
+
+            For i = runStart To runEnd
+
+                If rec(i).TUBlockId = 0 And IsTU(rec(i).Maker) Then
+
+                    maker = rec(i).Maker
+
+                    countTU = 0
+
+
+
+                    For j = runStart To runEnd
+
+                        If StrComp(rec(j).Maker, maker, vbTextCompare) = 0 Then
+
+                            countTU = countTU + 1
+
+                        End If
+
+                    Next j
+
+
+
+                    If countTU >= MIN_TU_ITEMS Then
+
+                        blockId = blockId + 1
+
+                        series = ""
+
+
+
+                        For j = runStart To runEnd
+
+                            If StrComp(rec(j).Maker, maker, vbTextCompare) = 0 Then
+
+                                series = SeriesCode( rec(j).Model, rec(j).Code)
+
+                                Exit For
+
+                            End If
+
+                        Next j
+
+
+
+                        For j = runStart To runEnd
+
+                            If StrComp(rec(j).Maker, maker, vbTextCompare) = 0 Then
+
+                                otherSeries = SeriesCode( rec(j).Model, rec(j).Code)
+
+                                If StrComp(series, otherSeries, vbTextCompare) <> 0 Then
+
+                                    series = ""
+
+                                    Exit For
+
+                                End If
+
+                            End If
+
+                        Next j
+
+
+
+                        For p = runStart To runEnd
+
+                            If StrComp(rec(p).Maker, maker, vbTextCompare) = 0 Then
+
+                                rec(p).TUBlockId = blockId
+
+                                rec(p).TUHeaderSeries = series
+
+                            End If
+
+                        Next p
+
+                    End If
+
+                End If
+
+            Next i
+
+        End If
+
+
+
+        runStart = runEnd + 1
+
+    Loop
+
+End Sub
+
+
+
+Private Function IsTU(s As String) As Boolean
+
+    s = CleanSpaces(s)
+
+    If Len(s) < 3 Or InStr(s, " ") > 0 Then Exit Function
+
+    IsTU = (Right(UCase(s), 2) = "ТУ" And InStr(s, ".") > 0)
+
+End Function
+
+
+
+Private Function SeriesCode(model As String, code As String) As String
+
+    ' При вынесении общего ТУ указываем серию изделия,
+
+    ' но не мощность, ёмкость, напряжение и номинал.
+
+    SeriesCode = ExtractComponentModel(code, model)
+
+End Function
+
+Private Function MakeTUHeaderRows( item As PERecord, t As Table) As Collection
+
+
+
+    Dim result As New Collection, lines As Collection
+
+    Dim s As String, piece As Variant
+
+
+
+    s = Trim(item.TUHeaderSeries)
+
+    If s <> "" Then s = s & " "
+
+    s = s & item.Maker
+
+
+
+    Set lines = WrapText(t, s, 2)
+
+    For Each piece In lines
+
+        result.Add Array( "", CStr(piece), "", "", False, wdAlignParagraphCenter, False, True, "", False, False)
+
+    Next piece
+
+    Set MakeTUHeaderRows = result
+
+End Function
+
+
+
+' =====================================
+
+' ФИЗИЧЕСКИЕ СТРОКИ КОМПОНЕНТА
+
+' =====================================
+
+
+
+Private Function MakeItemRows( item As PERecord, fullType As Boolean, t As Table, Optional hideTU As Boolean = False) As Collection
+
+
+
+    Dim result As New Collection, chunks As New Collection
+
+    Dim textLines As Collection, refLines As Collection
+
+    Dim remarkLines As Collection
+
+    Dim remarkNumbers As Collection
+
+    Dim model As String, maker As String, remark As String
+
+    Dim pair As Variant, piece As Variant
+
+    Dim i As Long, n As Long, refAlign As Long
+
+    Dim remarkStart As Long, remarkIndex As Long
+
+    Dim referenceNumber As Long
+
+    Dim refText As String, qtyText As String, remarkText As String
+
+    Dim hasRefWrap As Boolean
+
+
+
+    model = item.Model
+
+    maker = item.Maker
+
+
+
+    If item.Group <> "" Then
+
+        If fullType Then
+
+            model = FullTypeName(model, item.Code)
+
+        Else
+
+            model = RemoveType(model, item.Code)
+
+        End If
+
+    End If
+
+
+
+    If hideTU Then maker = ""
+
+
+
+    Set refLines = WrapReference(t, item.Ref)
+
+    hasRefWrap = (refLines.Count > 1)
+
+
+
+    Set remarkLines = New Collection
+
+    Set remarkNumbers = New Collection
+
+    If item.NoteNo > 0 Then AddReferenceLine remarkLines, remarkNumbers, t, item.NoteNo
+
+    If item.PickNo > 0 Then AddReferenceLine remarkLines, remarkNumbers, t, item.PickNo
+
+
+
+    If hasRefWrap Then
+
+        Set textLines = WrapText(t, model, 2)
+
+        For Each piece In textLines
+
+            chunks.Add Array(CStr(piece), "")
+
+        Next piece
+
+
+
+        Set textLines = WrapText(t, maker, 2)
+
+        For Each piece In textLines
+
+            chunks.Add Array("", CStr(piece))
+
+        Next piece
+
+    Else
+
+        If model <> "" And maker <> "" And TextFits(t, model & Space(4) & maker, 2) Then
+
+            chunks.Add Array(model, maker)
+
+        Else
+
+            Set textLines = WrapText(t, model, 2)
+
+            For Each piece In textLines
+
+                chunks.Add Array(CStr(piece), "")
+
+            Next piece
+
+
+
+            Set textLines = WrapText(t, maker, 2)
+
+            For Each piece In textLines
+
+                chunks.Add Array("", CStr(piece))
+
+            Next piece
+
+        End If
+
+    End If
+
+
+
+    If chunks.Count = 0 Then chunks.Add Array("", "")
+
+
+
+    n = chunks.Count
+
+    If refLines.Count > n Then n = refLines.Count
+
+    If remarkLines.Count > n Then n = remarkLines.Count
+
+    remarkStart = n - remarkLines.Count + 1
+
+
+
+    For i = 1 To n
+
+        If i <= chunks.Count Then
+
+            pair = chunks(i)
+
+        Else
+
+            pair = Array("", "")
+
+        End If
+
+
+
+        refText = ""
+
+        qtyText = ""
+
+        remarkText = ""
+
+        referenceNumber = 0
+
+
+
+        If i <= refLines.Count Then refText = CStr(refLines(i))
+
+        If remarkLines.Count > 0 And i >= remarkStart Then
+
+            remarkIndex = i - remarkStart + 1
+
+            remarkText = CStr(remarkLines(remarkIndex))
+
+            referenceNumber = CLng(remarkNumbers(remarkIndex))
+
+        End If
+
+
+
+        refAlign = wdAlignParagraphCenter
+
+        If hasRefWrap Then
+
+            If i = 1 Then
+
+                refAlign = wdAlignParagraphLeft
+
+            ElseIf i = refLines.Count Then
+
+                refAlign = wdAlignParagraphRight
+
+            End If
+
+        End If
+
+
+
+        If i = n Then qtyText = CStr(item.Qty)
+
+
+
+        result.Add Array( refText, CStr(pair(0)), CStr(pair(1)), qtyText, False, refAlign, (hasRefWrap And refText <> ""), False, remarkText, False, False, referenceNumber)
+
+    Next i
+
+
+
+    Set MakeItemRows = result
+
+End Function
+
+
+
+Private Sub NextPEPage( pages As Collection, ByRef rows As Collection, ByRef limit As Long)
+
+
+
+    FillPage rows, limit
+
+    Set rows = New Collection
+
+    pages.Add rows
+
+    limit = NEXT_ROWS
+
+    AddBlank rows
+
+End Sub
+
+
+
+Private Sub AddBlank(rows As Collection)
+
+    rows.Add Array( "", "", "", "", False, wdAlignParagraphCenter, False, False, "", False, False)
+
+End Sub
+
+
+
+Private Sub FillPage(rows As Collection, maxRows As Long)
+
+    Do While rows.Count < maxRows
+
+        AddBlank rows
+
+    Loop
+
+End Sub
+
+
+
+Private Function BuildReference( el() As PEItem, first As Long, last As Long) As String
+
+
+
+    Dim k As Long, j As Long
+
+    Dim result As String, part As String
+
+
+
+    result = ""
+
+    k = first
+
+
+
+    Do While k <= last
+
+        j = k
+
+        Do While j < last
+
+            If el(j + 1).TokenId <> el(k).TokenId Then Exit Do
+
+            If el(j + 1).Num <> el(j).Num + 1 Then Exit Do
+
+            j = j + 1
+
+        Loop
+
+
+
+        If j = k Then
+
+            part = el(k).Code & el(k).Num
+
+        Else
+
+            part = el(k).Code & el(k).Num & "-" & el(j).Code & el(j).Num
+
+        End If
+
+
+
+        If result <> "" Then result = result & ","
+
+        result = result & part
+
+        k = j + 1
+
+    Loop
+
+
+
+    BuildReference = result
+
+End Function
+
+
+
+' =====================================
+
+' ТИПЫ ЭЛЕМЕНТОВ
+
+' =====================================
+
+
+
+Private Function TypeKey(code As String, model As String) As String
+
+    If UCase$(code) = "R" And StartsWithTerm(model, "Перемычка") Then
+
+        TypeKey = "R_JUMPER"
+
+        Exit Function
+
+    End If
+
+    Select Case code
+
+        Case "D", "DA", "DD", "U"
+
+            TypeKey = "MICRO"
+
+        Case "G"
+
+            Select Case GComponentKind(model)
+
+                Case "POWER": TypeKey = "G_POWER"
+
+                Case "GENERATOR": TypeKey = "G_GENERATOR"
+
+                Case Else: TypeKey = "G_OTHER"
+
+            End Select
+
+        Case Else
+
+            TypeKey = code
+
+    End Select
+
+End Function
+
+
+
+Private Function GComponentKind(model As String) As String
+
+    If StartsWithTerm(model, "Модуль питания") Then
+
+        GComponentKind = "POWER"
+
+    ElseIf StartsWithTerm(model, "Генератор") Then
+
+        GComponentKind = "GENERATOR"
+
+    Else
+
+        GComponentKind = "OTHER"
+
+    End If
+
+End Function
+
+
+
+Private Function StartsWithTerm( s As String, term As String) As Boolean
+
+
+
+    Dim nextChar As String
+
+
+
+    s = Trim(s)
+
+    If term = "" Then Exit Function
+
+    If Len(s) < Len(term) Then Exit Function
+
+
+
+    If StrComp(Left(s, Len(term)), term, vbTextCompare) <> 0 Then
+
+        Exit Function
+
+    End If
+
+
+
+    If Len(s) = Len(term) Then
+
+        StartsWithTerm = True
+
+        Exit Function
+
+    End If
+
+
+
+    nextChar = Mid(s, Len(term) + 1, 1)
+
+    StartsWithTerm = (nextChar = " " Or nextChar = "-" Or nextChar = "," Or nextChar = "(")
+
+End Function
+
+
+
+' =====================================
+
+' WORD: СТРАНИЦЫ И ТАБЛИЦЫ
+
+' =====================================
+
+
+
+Private Sub WritePEPage( doc As Document, rows As Collection, pageNo As Long)
+
+
+
+    Dim rg As Range, t As Table, data As Variant
+
+    Dim r As Long, pos As Long, sectionNum As Long
+
+
+
+    If pageNo = 1 Then
+
+        sectionNum = 1
+
+    Else
+
+        sectionNum = 2
+
+    End If
+
+
+
+    If pageNo <= 2 Then
+
+        pos = doc.Sections(sectionNum).Range.Start
+
+        Set rg = doc.Range(pos, pos)
+
+    Else
+
+        pos = doc.Sections(2).Range.End - 1
+
+        Set rg = doc.Range(pos, pos)
+
+        rg.InsertBreak wdPageBreak
+
+        pos = doc.Sections(2).Range.End - 1
+
+        Set rg = doc.Range(pos, pos)
+
+    End If
+
+
+
+    Set t = doc.Tables.Add(rg, rows.Count, 4)
+
+    FormatPETable t, pageNo
+
+
+
+    For r = 1 To rows.Count
+
+        data = rows(r)
+
+        WritePERow t, r, data
+
+    Next r
+
+End Sub
+
+
+
+Private Sub ClearSectionBody( doc As Document, sectionNum As Long)
+
+
+
+    Dim rg As Range
+
+    Set rg = doc.Sections(sectionNum).Range.Duplicate
+
+    rg.End = rg.End - 1
+
+    If rg.End > rg.Start Then rg.Delete
+
+End Sub
+
+
+
+Private Sub SetupPEPage(sec As Section)
+
+    With sec.PageSetup
+
+        .PaperSize = wdPaperA4
+
+        .Orientation = wdOrientPortrait
+
+        .TopMargin = 0
+
+        .BottomMargin = 0
+
+        .LeftMargin = 0
+
+        .RightMargin = 0
+
+    End With
+
+End Sub
+
+
+
+Private Sub FormatPETable( t As Table, Optional pageNo As Long = 1, Optional forMeasure As Boolean = False)
+
+
+
+    Dim c As Cell
+
+    t.AutoFitBehavior wdAutoFitFixed
+
+
+
+    If pageNo = 1 Then
+
+        t.Columns(1).Width = CentimetersToPoints(1.99)
+
+        t.Columns(2).Width = CentimetersToPoints(11)
+
+        t.Columns(3).Width = CentimetersToPoints(1)
+
+        t.Columns(4).Width = CentimetersToPoints(4.2)
+
+    Else
+
+        t.Columns(1).Width = CentimetersToPoints(2)
+
+        t.Columns(2).Width = CentimetersToPoints(11)
+
+        t.Columns(3).Width = CentimetersToPoints(1)
+
+        t.Columns(4).Width = CentimetersToPoints(4.5)
+
+    End If
+
+
+
+    With t
+
+        .Borders.Enable = True
+
+        .TopPadding = 0
+
+        .BottomPadding = 0
+
+        .LeftPadding = CentimetersToPoints(0.1)
+
+        .RightPadding = CentimetersToPoints(0.2)
+
+    End With
+
+
+
+    For Each c In t.Columns(1).Cells
+
+        If forMeasure Then
+
+            c.LeftPadding = CentimetersToPoints(REF_PADDING)
+
+            c.RightPadding = CentimetersToPoints(REF_PADDING)
+
+        Else
+
+            c.LeftPadding = 0
+
+            c.RightPadding = 0
+
+        End If
+
+    Next c
+
+
+
+    With t.Rows
+
+        .AllowBreakAcrossPages = False
+
+        If forMeasure Then
+
+            .HeightRule = wdRowHeightAtLeast
+
+        Else
+
+            .HeightRule = wdRowHeightExactly
+
+            .Height = CentimetersToPoints(0.8)
+
+            .WrapAroundText = True
+
+            .RelativeHorizontalPosition = wdRelativeHorizontalPositionPage
+
+            .RelativeVerticalPosition = wdRelativeVerticalPositionPage
+
+            If pageNo = 1 Then
+
+                .HorizontalPosition = CentimetersToPoints(2.12)
+
+                .VerticalPosition = CentimetersToPoints(2.13)
+
+            Else
+
+                .HorizontalPosition = CentimetersToPoints(1.82)
+
+                .VerticalPosition = CentimetersToPoints(2.42)
+
+            End If
+
+            .AllowOverlap = False
+
+        End If
+
+    End With
+
+
+
+    t.Range.Cells.VerticalAlignment = wdCellAlignVerticalCenter
+
+    With t.Range
+
+        .Font.Name = "Arial"
+
+        .Font.Size = 12
+
+        With .ParagraphFormat
+
+            .SpaceBefore = 0
+
+            .SpaceAfter = 0
+
+            .LeftIndent = 0
+
+            .RightIndent = 0
+
+            .FirstLineIndent = 0
+
+            .LineSpacingRule = wdLineSpaceSingle
+
+            .KeepWithNext = False
+
+            .KeepTogether = False
+
+            .WidowControl = False
+
+        End With
+
+    End With
+
+End Sub
+
+
+
+Private Sub WritePERow( t As Table, rowNum As Long, data As Variant)
+
+
+
+    Dim model As String, maker As String, remark As String
+
+    Dim isHeader As Boolean, isTUHeader As Boolean
+
+    Dim isNotesTitle As Boolean, isNoteEntry As Boolean
+
+    Dim refAlign As Long, refWrapped As Boolean
+
+    Dim noteNumber As Long
+
+    Dim tabPos As Single
+
+    Dim c As Cell, noteRange As Range, linkRange As Range, spaceRange As Range
+
+    Dim seqField As Field, linkField As Field
+
+    Dim seqCode As String
+
+    Dim bookmarkName As String, numberText As String
+
+
+
+    model = CStr(data(1))
+
+    maker = CStr(data(2))
+
+    remark = CStr(data(8))
+
+    isHeader = CBool(data(4))
+
+    refAlign = CLng(data(5))
+
+    refWrapped = CBool(data(6))
+
+    isTUHeader = CBool(data(7))
+
+    isNotesTitle = CBool(data(9))
+
+    isNoteEntry = CBool(data(10))
+
+
+
+    noteNumber = 0
+
+    If UBound(data) >= 11 Then
+
+        noteNumber = CLng(data(11))
+
+    End If
+
+
+
+    ' Первая графа: позиционное обозначение.
+
+    Set c = t.Cell(rowNum, 1)
+
+    If refWrapped Then
+
+        c.LeftPadding = CentimetersToPoints(REF_PADDING)
+
+        c.RightPadding = CentimetersToPoints(REF_PADDING)
+
+    Else
+
+        c.LeftPadding = 0
+
+        c.RightPadding = 0
+
+    End If
+
+    With c.Range
+
+        .Text = CStr(data(0))
+
+        .ParagraphFormat.Alignment = refAlign
+
+    End With
+
+
+
+    ' Третья графа: количество.
+
+    With t.Cell(rowNum, 3).Range
+
+        .Text = CStr(data(3))
+
+        .ParagraphFormat.Alignment = wdAlignParagraphCenter
+
+    End With
+
+
+
+    ' Четвертая графа: "См. примечание" + поле REF.
+
+    ' Число является полем Word, а не обычной строкой.
+
+    If noteNumber > 0 And Not isNoteEntry Then
+
+        numberText = CStr(noteNumber)
+
+
+
+        If Right$(remark, Len(numberText)) <> numberText Then
+
+            Err.Raise vbObjectError + 151, , "Некорректная ссылка на примечание: " & remark
+
+        End If
+
+
+
+        ' Не оставляем пробел как конечный символ содержимого ячейки:
+
+        ' Word может его удалить при вставке поля. Добавим пробел
+
+        ' отдельно перед началом поля REF уже ПОСЛЕ вставки.
+
+        remark = RTrim$(Left$(remark, Len(remark) - Len(numberText)))
+
+    End If
+
+
+
+    With t.Cell(rowNum, 4).Range
+
+        .Text = remark
+
+        .ParagraphFormat.Alignment = wdAlignParagraphLeft
+
+    End With
+
+
+
+    If noteNumber > 0 And Not isNoteEntry Then
+
+        bookmarkName = PENoteBookmark(noteNumber)
+
+        Set linkRange = t.Cell(rowNum, 4).Range.Duplicate
+
+        linkRange.End = linkRange.End - 2
+
+        linkRange.Collapse wdCollapseEnd
+
+
+
+        ' REF читает текст закладки вокруг SEQ и создает гиперссылку.
+
+        Set linkField = t.Range.Document.Fields.Add(Range:=linkRange, Type:=wdFieldEmpty, Text:="REF " & bookmarkName & " \h", PreserveFormatting:=False)
+
+        Set spaceRange = t.Range.Document.Range(linkField.Code.Start - 1, linkField.Code.Start - 1)
+
+        spaceRange.InsertBefore ChrW(160)
+
+    End If
+
+
+
+    ' Вторая графа: наименование и текст примечания.
+
+    Set c = t.Cell(rowNum, 2)
+
+    tabPos = t.Columns(2).Width - CentimetersToPoints(0.3)
+
+    If isTUHeader Then
+
+        c.LeftPadding = 0
+
+        c.RightPadding = 0
+
+    End If
+
+
+
+    With c.Range
+
+        If isHeader Or isTUHeader Then
+
+            .Text = model
+
+            .ParagraphFormat.Alignment = wdAlignParagraphCenter
+
+        ElseIf isNotesTitle Or isNoteEntry Then
+
+            If isNoteEntry And noteNumber > 0 Then
+
+                ' Число поставим полем SEQ перед точкой.
+
+                .Text = ". " & model
+
+            Else
+
+                .Text = model
+
+            End If
+
+            .ParagraphFormat.Alignment = wdAlignParagraphLeft
+
+        ElseIf model <> "" And maker <> "" Then
+
+            .Text = model & vbTab & maker
+
+            .ParagraphFormat.Alignment = wdAlignParagraphLeft
+
+            With .ParagraphFormat.TabStops
+
+                .ClearAll
+
+                .Add Position:=tabPos, Alignment:=wdAlignTabRight
+
+            End With
+
+        ElseIf maker <> "" Then
+
+            .Text = maker
+
+            .ParagraphFormat.Alignment = wdAlignParagraphRight
+
+        Else
+
+            .Text = model
+
+            .ParagraphFormat.Alignment = wdAlignParagraphLeft
+
+        End If
+
+    End With
+
+
+
+    ' Первая строка примечания получает поле SEQ и закладку.
+
+    ' Многоуровневые списки и стиль ПРИМЕЧАНИЯ не используются.
+
+    If isNoteEntry And noteNumber > 0 Then
+
+        Set noteRange = c.Range.Paragraphs(1).Range.Duplicate
+
+        noteRange.Style = wdStyleNormal
+
+        noteRange.ListFormat.RemoveNumbers
+
+
+
+        With noteRange.ParagraphFormat
+
+            .SpaceBefore = 0
+
+            .SpaceAfter = 0
+
+            .LeftIndent = 0
+
+            .FirstLineIndent = 0
+
+            .LineSpacingRule = wdLineSpaceSingle
+
+            .Alignment = wdAlignParagraphLeft
+
+        End With
+
+        noteRange.Font.Name = "Arial"
+
+        noteRange.Font.Size = 12
+
+
+
+        Set noteRange = c.Range.Duplicate
+
+        noteRange.End = noteRange.End - 2
+
+        noteRange.Collapse wdCollapseStart
+
+
+
+        ' Серия SEQ начинается с 1 сама и не фиксирует сброс.
+
+        ' Если пользователь добавит примечание перед первым,
+
+        ' существующие поля сохранят правильный порядок.
+
+        seqCode = "SEQ PENote \* ARABIC"
+
+
+
+        Set seqField = t.Range.Document.Fields.Add(Range:=noteRange, Type:=wdFieldEmpty, Text:=seqCode, PreserveFormatting:=False)
+
+        seqField.Update
+
+
+
+        ' REF будет брать именно содержимое поля SEQ, а не номер абзаца.
+
+        bookmarkName = PENoteBookmark(noteNumber)
+
+        t.Range.Document.Bookmarks.Add Name:=bookmarkName, Range:=seqField.Result
+
+    End If
+
+
+
+    t.Rows(rowNum).Cells.VerticalAlignment = wdCellAlignVerticalCenter
+
+End Sub
+
+
+
+' =====================================
+
+' НУМЕРАЦИЯ SEQ И ПЕРЕКРЕСТНЫЕ ССЫЛКИ
+
+' =====================================
+
+
+
+Private Function PENoteBookmark(noteNumber As Long) As String
+
+    PENoteBookmark = NOTE_BOOKMARK_PREFIX & Format$(noteNumber, "00000")
+
+End Function
+
+
+
+' Обновление после ручной вставки, удаления или переноса примечаний.
+
+' В Word: Alt+F8 -> RefreshPENoteReferences.
+
+Public Sub RefreshPENoteReferences()
+
+    UpdatePEReferences ActiveDocument
+
+    ActiveDocument.Repaginate
+
+    MsgBox "Номера примечаний и перекрестные ссылки обновлены."
+
+End Sub
+
+
+
+Private Sub UpdatePEReferences(doc As Document)
+
+    Dim f As Field
+
+
+
+    ' Сначала обновляем все поля SEQ нашей серии в порядке документа.
+
+    ' Это корректно перенумерует записи после ручного редактирования.
+
+    For Each f In doc.Fields
+
+        If f.Type = wdFieldSequence Then
+
+            If InStr(1, UCase$(f.Code.Text), "PENOTE", vbTextCompare) > 0 Then
+
+                f.Update
+
+            End If
+
+        End If
+
+    Next f
+
+
+
+    ' Затем пересчитываем ссылки на закладки вокруг результатов SEQ.
+
+    For Each f In doc.Fields
+
+        If f.Type = wdFieldRef Then
+
+            f.Update
+
+        End If
+
+    Next f
+
+End Sub
+
+
+
+' =====================================
+
+' ИЗМЕРЕНИЕ И ПЕРЕНОС ТЕКСТА
+
+' =====================================
+
+
+
+Private Function TextFits( t As Table, s As String, column As Long) As Boolean
+
+    Dim rg As Range, lineCount As Long
+
+    Dim cacheKey As String
+
+    Dim fits As Boolean
+
+
+
+    If s = "" Then
+
+        TextFits = True
+
+        Exit Function
+
+    End If
+
+
+
+    ' Ключ учитывает ширину графы, номер графы, отступы и текст.
+
+    ' Это предотвращает ошибочное повторное использование результата
+
+    ' для первой и последующих страниц.
+
+    cacheKey = CStr(column) & "|" & CStr(t.Columns(column).Width) & "|" & CStr(t.Cell(1, column).LeftPadding) & "|" & CStr(t.Cell(1, column).RightPadding) & "|" & s
+
+    If Not gTextFitCache Is Nothing Then
+
+        If gTextFitCache.Exists(cacheKey) Then
+
+            TextFits = CBool(gTextFitCache(cacheKey))
+
+            Exit Function
+
+        End If
+
+    End If
+
+
+
+    t.Cell(1, column).Range.Text = s
+
+    Set rg = t.Cell(1, column).Range.Duplicate
+
+    rg.Font.Name = "Arial"
+
+    rg.Font.Size = 12
+
+    rg.End = rg.End - 2
+
+
+
+    ' ComputeStatistics сам запрашивает нужные сведения о строках.
+
+    ' Полную пагинацию документа при каждой проверке не запускаем.
+
+    lineCount = rg.ComputeStatistics(wdStatisticLines)
+
+    If lineCount < 1 Then
+
+        ' Защитный резервный путь для необычных версий Word.
+
+        rg.Document.Repaginate
+
+        lineCount = rg.ComputeStatistics(wdStatisticLines)
+
+    End If
+
+    fits = (lineCount = 1)
+
+    If Not gTextFitCache Is Nothing Then gTextFitCache.Add cacheKey, fits
+
+    TextFits = fits
+
+End Function
+
+
+
+Private Function WrapText( t As Table, s As String, column As Long) As Collection
+
+
+
+    Dim result As New Collection
+
+    Dim words As Variant, word As Variant
+
+    Dim line As String, candidate As String, part As String
+
+    Dim n As Long
+
+
+
+    s = CleanSpaces(s)
+
+    If s = "" Then
+
+        Set WrapText = result
+
+        Exit Function
+
+    End If
+
+
+
+    words = Split(s, " ")
+
+    For Each word In words
+
+        part = CStr(word)
+
+        If line = "" Then
+
+            candidate = part
+
+        Else
+
+            candidate = line & " " & part
+
+        End If
+
+
+
+        If TextFits(t, candidate, column) Then
+
+            line = candidate
+
+        Else
+
+            If line <> "" Then
+
+                result.Add line
+
+                line = ""
+
+            End If
+
+            If TextFits(t, part, column) Then
+
+                line = part
+
+            Else
+
+                Do While part <> ""
+
+                    n = LongestPart(t, part, column)
+
+                    If n < 1 Then
+
+                        Err.Raise vbObjectError + 130, , "Не помещается символ: " & Left(part, 1)
+
+                    End If
+
+                    result.Add Left(part, n)
+
+                    part = Mid(part, n + 1)
+
+                Loop
+
+            End If
+
+        End If
+
+    Next word
+
+
+
+    If line <> "" Then result.Add line
+
+    Set WrapText = result
+
+End Function
+
+
+
+Private Function WrapReference( t As Table, s As String) As Collection
+
+
+
+    Dim result As New Collection
+
+    Dim items As Variant
+
+    Dim item As String, suffix As String
+
+    Dim line As String, candidate As String
+
+    Dim leftPart As String, rightPart As String
+
+    Dim i As Long, p As Long
+
+    Dim firstNum As Long, lastNum As Long, previousNum As Long
+
+    Dim forceRange As Boolean, forceNewLine As Boolean
+
+
+
+    If s = "" Then
+
+        Set WrapReference = result
+
+        Exit Function
+
+    End If
+
+
+
+    items = Split(s, ",")
+
+    previousNum = 0
+
+    line = ""
+
+
+
+    ' В v2.6 отсутствовала закрывающая скобка UBound(items).
+
+    For i = LBound(items) To UBound(items)
+
+        item = Trim(CStr(items(i)))
+
+        suffix = ""
+
+        If i < UBound(items) Then suffix = ","
+
+        p = InStr(item, "-")
+
+
+
+        If p > 0 Then
+
+            leftPart = Left(item, p)
+
+            rightPart = Mid(item, p + 1)
+
+            firstNum = RefNum(Left(item, p - 1))
+
+            lastNum = RefNum(rightPart)
+
+        Else
+
+            firstNum = RefNum(item)
+
+            lastNum = firstNum
+
+        End If
+
+
+
+        forceRange = False
+
+        If p > 0 Then
+
+            If firstNum > 100 Or lastNum > 100 Then
+
+                forceRange = True
+
+            End If
+
+        End If
+
+
+
+        If p > 0 And (forceRange Or Not TextFits(t, item & suffix, 1)) Then
+
+            If line <> "" Then
+
+                result.Add line
+
+                line = ""
+
+            End If
+
+            If Not TextFits(t, leftPart, 1) Then
+
+                Err.Raise vbObjectError + 131, , "Не помещается: " & leftPart
+
+            End If
+
+            result.Add leftPart
+
+            candidate = rightPart & suffix
+
+            If Not TextFits(t, candidate, 1) Then
+
+                Err.Raise vbObjectError + 132, , "Не помещается: " & candidate
+
+            End If
+
+            line = candidate
+
+        Else
+
+            candidate = item & suffix
+
+            forceNewLine = False
+
+            If line <> "" Then
+
+                If previousNum > 100 Or firstNum > 100 Then
+
+                    forceNewLine = True
+
+                End If
+
+            End If
+
+
+
+            If line = "" Then
+
+                If Not TextFits(t, candidate, 1) Then
+
+                    Err.Raise vbObjectError + 133, , "Не помещается: " & candidate
+
+                End If
+
+                line = candidate
+
+            ElseIf Not forceNewLine And TextFits(t, line & candidate, 1) Then
+
+                line = line & candidate
+
+            Else
+
+                result.Add line
+
+                If Not TextFits(t, candidate, 1) Then
+
+                    Err.Raise vbObjectError + 134, , "Не помещается: " & candidate
+
+                End If
+
+                line = candidate
+
+            End If
+
+        End If
+
+        previousNum = lastNum
+
+    Next i
+
+
+
+    If line <> "" Then result.Add line
+
+    Set WrapReference = result
+
+End Function
+
+
+
+Private Function LongestPart( t As Table, s As String, column As Long) As Long
+
+
+
+    Dim lo As Long, hi As Long, mid As Long
+
+
+
+    If Len(s) = 0 Then Exit Function
+
+    If Not TextFits(t, Left(s, 1), column) Then
+
+        LongestPart = 0
+
+        Exit Function
+
+    End If
+
+
+
+    lo = 1
+
+    hi = Len(s)
+
+    Do While lo < hi
+
+        mid = (lo + hi + 1) \ 2
+
+        If TextFits(t, Left(s, mid), column) Then
+
+            lo = mid
+
+        Else
+
+            hi = mid - 1
+
+        End If
+
+    Loop
+
+    LongestPart = lo
+
+End Function
+
+
+
+' =====================================
+
+' РАЗБОР И НОРМАЛИЗАЦИЯ НАИМЕНОВАНИЙ
+
+' =====================================
+
+
+
+Private Sub SplitName( s As String, ByRef model As String, ByRef maker As String)
+
+
+
+    Dim p As Long, word As String
+
+
+
+    s = CleanSpaces(s)
+
+    model = s
+
+    maker = ""
+
+    p = InStr(1, s, " ф. ", vbTextCompare)
+
+
+
+    If p > 0 Then
+
+        model = Trim(Left(s, p - 1))
+
+        maker = Trim(Mid(s, p + 1))
+
+    Else
+
+        p = InStrRev(s, " ")
+
+        If p > 0 Then
+
+            word = Trim(Mid(s, p + 1))
+
+            If IsTU(word) Then
+
+                model = Trim(Left(s, p - 1))
+
+                maker = word
+
+            End If
+
+        End If
+
+    End If
+
+
+
+    model = NormalizeModelName(model)
+
+End Sub
+
+
+
+ ' =====================================
+
+' УСЛОВНОЕ ПЕРЕИМЕНОВАНИЕ НАБОРА
+
+' =====================================
+
+
+
+Private Function HasOrdinaryResistors(excelData As Variant) As Boolean
+
+    Dim i As Long
+
+    Dim designation As String
+
+    Dim nameText As String
+
+    Dim code As String
+
+
+
+    For i = 1 To UBound(excelData, 1)
+
+        ' Ошибки Excel и пустые строки пропускаем.
+
+        If VarType(excelData(i, 1)) <> vbError Then
+
+            If VarType(excelData(i, 2)) <> vbError Then
+
+                If VarType(excelData(i, 1)) <> vbEmpty Then
+
+                    If VarType(excelData(i, 2)) <> vbEmpty Then
+
+                        designation = CleanSpaces(CStr(excelData(i, 1)))
+
+                        nameText = CleanSpaces(CStr(excelData(i, 2)))
+
+                        code = RefCode(designation)
+
+
+
+                        If code = "R" Then
+
+                            If StartsWithTerm(nameText, "Резистор") Then
+
+                                HasOrdinaryResistors = True
+
+                                Exit Function
+
+                            End If
+
+                        End If
+
+                    End If
+
+                End If
+
+            End If
+
+        End If
+
+    Next i
+
+End Function
+
+
+
+Private Function NormalizeResistorSet( s As String, hasOtherResistors As Boolean) As String
+
+
+
+    s = CleanSpaces(s)
+
+
+
+    If hasOtherResistors Then
+
+        s = ReplaceLeading(s, "Набор резисторов", "Резистор")
+
+    End If
+
+
+
+    NormalizeResistorSet = s
+
+End Function
+
+
+
+Private Function NormalizeModelName(s As String) As String
+
+    s = Trim(s)
+
+    s = ReplaceLeading(s, "Модуль электропитания", "Модуль питания")
+
+    s = ReplaceLeading(s, "Источник электропитания", "Модуль питания")
+
+    s = ReplaceLeading(s, "Источник питания", "Модуль питания")
+
+    ' s = ReplaceLeading(s, "Старое название", "Новое название")
+
+    NormalizeModelName = s
+
+End Function
+
+
+
+Private Function ReplaceLeading( s As String, oldText As String, newText As String) As String
+
+
+
+    s = Trim(s)
+
+    If StartsWithTerm(s, oldText) Then
+
+        ReplaceLeading = newText & Mid(s, Len(oldText) + 1)
+
+    Else
+
+        ReplaceLeading = s
+
+    End If
+
+End Function
+
+
+
+Private Function RefCode(s As String) As String
+
+    Dim i As Long
+
+    s = UCase(Trim(s))
+
+    If Len(s) = 0 Then Exit Function
+
+    For i = 1 To Len(s)
+
+        If Mid(s, i, 1) Like "#" Then Exit For
+
+    Next i
+
+    If i <= Len(s) Then
+
+        RefCode = Left(s, i - 1)
+
+    Else
+
+        RefCode = ""
+
+    End If
+
+End Function
+
+
+
+Private Function RefNum(s As String) As Long
+
+    Dim i As Long
+
+    For i = 1 To Len(s)
+
+        If Mid(s, i, 1) Like "#" Then
+
+            RefNum = Val(Mid(s, i))
+
+            Exit Function
+
+        End If
+
+    Next i
+
+End Function
+
+
+
+Private Function PrefixName(code As String, model As String) As String
+
+    Select Case UCase$(Trim$(code))
+
+        Case "C"
+
+            PrefixName = "Конденсатор"
+
+        Case "R"
+
+            If StartsWithTerm(model, "Набор резисторов") Or StartsWithTerm(model, "Перемычка") Then
+
+                PrefixName = ""
+
+            Else
+
+                PrefixName = "Резистор"
+
+            End If
+
+        Case "D", "DA", "DD", "U"
+
+            PrefixName = "Микросхема"
+
+        Case "XP"
+
+            PrefixName = "Вилка"
+
+        Case "XS"
+
+            PrefixName = "Розетка"
+
+        Case "Z"
+
+            PrefixName = "Модуль защиты"
+
+        Case "G"
+
+            If GComponentKind(model) = "POWER" Then PrefixName = "Модуль питания"
+
+        Case Else
+
+            PrefixName = ""
+
+    End Select
+
+End Function
+
+Private Function RemoveType(s As String, code As String) As String
+
+    Dim prefix As String
+
+    s = Trim(s)
+
+    prefix = PrefixName(code, s)
+
+    If prefix <> "" Then
+
+        If StartsWithTerm(s, prefix) Then
+
+            s = Trim(Mid(s, Len(prefix) + 1))
+
+        End If
+
+    End If
+
+    RemoveType = s
+
+End Function
+
+
+
+Private Function FullTypeName(s As String, code As String) As String
+
+    Dim prefix As String
+
+    s = Trim(s)
+
+    prefix = PrefixName(code, s)
+
+    If prefix = "" Then
+
+        FullTypeName = s
+
+        Exit Function
+
+    End If
+
+    If StartsWithTerm(s, "Модуль питания") Or StartsWithTerm(s, "Генератор") Then
+
+        FullTypeName = s
+
+        Exit Function
+
+    End If
+
+    If StartsWithTerm(s, prefix) Then
+
+        FullTypeName = s
+
+    Else
+
+        FullTypeName = prefix & " " & s
+
+    End If
+
+End Function
+
+
+
+Private Function GroupName(code As String, model As String) As String
+
+    Select Case UCase$(Trim$(code))
+
+        Case "C"
+
+            GroupName = "КОНДЕНСАТОРЫ"
+
+        Case "R"
+
+            If StartsWithTerm(model, "Перемычка") Then
+
+                GroupName = "ПЕРЕМЫЧКИ"
+
+            Else
+
+                GroupName = "РЕЗИСТОРЫ"
+
+            End If
+
+        Case "D", "DA", "DD", "U"
+
+            GroupName = "МИКРОСХЕМЫ"
+
+        Case "XP"
+
+            GroupName = "ВИЛКИ"
+
+        Case "XS"
+
+            GroupName = "РОЗЕТКИ"
+
+        Case "Z"
+
+            GroupName = "МОДУЛИ ЗАЩИТЫ"
+
+        Case "G"
+
+            If GComponentKind(model) = "POWER" Then GroupName = "МОДУЛИ ПИТАНИЯ"
+
+        Case Else
+
+            GroupName = ""
+
+    End Select
+
+End Function
+
